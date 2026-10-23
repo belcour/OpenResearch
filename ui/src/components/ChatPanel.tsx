@@ -2974,11 +2974,33 @@ function downloadMarkdown(fileName: string, markdown: string) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+/** When a prompt was sent or an answer finished. Shows only the clock time for
+ * today, and adds the date for older messages; the full timestamp is in the tooltip. */
+function MessageTime({ at, className = "" }: { at: number; className?: string }) {
+  const date = new Date(at);
+  if (Number.isNaN(date.getTime())) return null;
+  const now = new Date();
+  const sameDay = date.toDateString() === now.toDateString();
+  const label = date.toLocaleString(getLocale(), {
+    ...(sameDay ? {} : { month: "short", day: "numeric", ...(date.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }) }),
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  return (
+    <time
+      dateTime={date.toISOString()}
+      title={date.toLocaleString(getLocale(), { dateStyle: "full", timeStyle: "medium" })}
+      className={`msg-time text-xs text-subtext tabular-nums select-none ${className}`}
+    >
+      {label}
+    </time>
+  );
+}
+
 /** The pager stays visible once a prompt has more than one version — hiding it
  * would leave no sign that the other versions exist. */
 function ForkControls({
   text,
-  createdAt,
   count,
   index,
   prevId,
@@ -2989,7 +3011,6 @@ function ForkControls({
   editDisabled,
 }: {
   text: string;
-  createdAt: number;
   count: number;
   index: number;
   prevId?: string;
@@ -3000,7 +3021,6 @@ function ForkControls({
   editDisabled: boolean;
 }) {
   const many = count > 1;
-  const sentAt = new Date(createdAt);
   const copy = () => copyToClipboard(text);
   return (
     <div
@@ -3034,9 +3054,6 @@ function ForkControls({
         </>
       )}
       <div className="flex items-center gap-0.5 opacity-0 group-hover/turn:opacity-100 group-focus-within/turn:opacity-100 transition-opacity duration-80 ease-standard">
-        <time dateTime={sentAt.toISOString()} className="text-xs text-subtext tabular-nums me-2">
-          {sentAt.toLocaleTimeString(getLocale(), { hour: "numeric", minute: "2-digit" })}
-        </time>
         <IconButton size="small" aria-label={m.md_copy()} disabled={!text} onClick={copy}>
           <Copy size={14} />
         </IconButton>
@@ -3223,19 +3240,23 @@ export const Message = memo(function Message({
             </div>
           )}
         </div>
-        {forkCount !== undefined && (
-          <ForkControls
-            text={text}
-            createdAt={message.createdAt}
-            count={forkCount}
-            index={forkIndex}
-            prevId={forkPrevId}
-            nextId={forkNextId}
-            onSelect={onSelectFork}
-            pagerDisabled={branchDisabled}
-            onEdit={() => setEditDraft(text)}
-            editDisabled={forkDisabled}
-          />
+        {forkCount !== undefined ? (
+          <div className="flex items-center gap-2">
+            <MessageTime at={message.createdAt} />
+            <ForkControls
+              text={text}
+              count={forkCount}
+              index={forkIndex}
+              prevId={forkPrevId}
+              nextId={forkNextId}
+              onSelect={onSelectFork}
+              pagerDisabled={branchDisabled}
+              onEdit={() => setEditDraft(text)}
+              editDisabled={forkDisabled}
+            />
+          </div>
+        ) : (
+          <MessageTime at={message.createdAt} />
         )}
       </div>
     );
@@ -3247,6 +3268,8 @@ export const Message = memo(function Message({
   const response = splitResponseParts(turns, predictTextTail, replies);
   const predictingAnswer = predictTextTail && response.answerMessageId === message.id;
   const copyText = predictingAnswer && !message.completedAt ? "" : responseText({ ...message, parts: response.answer });
+  // The answer counts as generated when its last turn finished.
+  const answeredAt = turns[turns.length - 1]?.completedAt ?? null;
   return (
     <div className="msg-assistant group/turn text-base leading-relaxed text-text min-w-0">
       {turns.length > 0 && <AssistantTurn messages={turns} response={response} options={{
@@ -3280,17 +3303,22 @@ export const Message = memo(function Message({
           {cleanToolError(turn.parts[0]?.state?.error ?? "")}
         </div>
       ))}
-      {copyText && (
-        <div className="mt-2 flex justify-end opacity-0 transition-opacity duration-80 ease-standard group-hover/turn:opacity-100 group-focus-within/turn:opacity-100">
-          <Tooltip interactive content={m.chat_copy_response()}>
-            <IconButton
-              size="small"
-              aria-label={m.chat_copy_response()}
-              onClick={() => void copyToClipboard(copyText)}
-            >
-              <Copy size={14} />
-            </IconButton>
-          </Tooltip>
+      {(copyText || answeredAt !== null) && (
+        <div className="mt-2 flex items-center justify-end gap-2">
+          {answeredAt !== null && <MessageTime at={answeredAt} />}
+          {copyText && (
+            <div className="opacity-0 transition-opacity duration-80 ease-standard group-hover/turn:opacity-100 group-focus-within/turn:opacity-100">
+              <Tooltip interactive content={m.chat_copy_response()}>
+                <IconButton
+                  size="small"
+                  aria-label={m.chat_copy_response()}
+                  onClick={() => void copyToClipboard(copyText)}
+                >
+                  <Copy size={14} />
+                </IconButton>
+              </Tooltip>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -4317,7 +4345,7 @@ function SessionRow({
         if (!ref.current?.contains(event.relatedTarget) && !cardRef.current?.contains(event.relatedTarget)) dismissed.current = false;
         scheduleClose();
       }}
-      className={`session-row relative flex items-center gap-2 w-full h-8.5 text-start ps-2.5 pe-1.5 rounded-md text-sm text-text cursor-pointer select-none [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium [&_.session-dot:empty]:hidden [&_.session-dot]:w-4 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:[mask-image:linear-gradient(to_right,black_calc(100%_-_16px),transparent)] [&_.session-title]:whitespace-nowrap [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:w-4 [&_.session-menu-btn]:h-4 [&_.session-menu-btn]:-my-0.5 [&_.session-menu-btn]:mx-0 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-visible_.session-menu-btn]:inline-flex [&_.session-menu-btn:focus-within]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&.card-open_.session-menu-btn]:inline-flex [&:hover_.session-dot]:hidden [&:focus-visible_.session-dot]:hidden [&:has(.session-menu-btn:focus-within)_.session-dot]:hidden [&.menu-open_.session-dot]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-accent-teal [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-accent-blue [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:flex-1 [&_.session-title-input]:min-w-0 [&_.session-title-input]:py-px [&_.session-title-input]:px-1 [&_.session-title-input]:-my-0.5 [&_.session-title-input]:mx-0 [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-focus-border [&_.session-title-input]:rounded-sm [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-dot]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""} ${anchor ? "card-open" : ""}  ${
+      className={`session-row relative flex items-center gap-2 w-full h-8.5 text-start ps-2.5 pe-1.5 rounded-md text-sm text-text cursor-pointer select-none [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium [&_.session-dot:empty]:hidden [&_.session-dot]:w-4 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:[mask-image:linear-gradient(to_right,black_calc(100%_-_16px),transparent)] [&_.session-title]:whitespace-nowrap [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:w-4 [&_.session-menu-btn]:h-4 [&_.session-menu-btn]:-my-0.5 [&_.session-menu-btn]:mx-0 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-visible_.session-menu-btn]:inline-flex [&_.session-menu-btn:focus-within]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&.card-open_.session-menu-btn]:inline-flex [&:hover_.session-dot]:hidden [&:focus-visible_.session-dot]:hidden [&:has(.session-menu-btn:focus-within)_.session-dot]:hidden [&.menu-open_.session-dot]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-accent-teal [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-accent-green [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:flex-1 [&_.session-title-input]:min-w-0 [&_.session-title-input]:py-px [&_.session-title-input]:px-1 [&_.session-title-input]:-my-0.5 [&_.session-title-input]:mx-0 [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-focus-border [&_.session-title-input]:rounded-sm [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-dot]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""} ${anchor ? "card-open" : ""}  ${
         editing ? "editing" : ""
         }`}
       onClick={() => {
@@ -5530,16 +5558,15 @@ export function ChatPanel({
 
   // Reset everything when the project changes.
   useEffect(() => {
-    const readDemoSessions = loadReadDemoSessions();
-    setUnreadSessionIds(
-      projectId === DEMO_PROJECT_ID
-        ? new Set(
-          [DEMO_FIGURE_SESSION_ID, DEMO_LITERATURE_SESSION_ID].filter(
-            (sessionId) => !readDemoSessions.has(sessionId),
-          ),
-        )
-        : new Set(),
-    );
+    // Unread marks span projects, so switching project keeps them; the demo
+    // project only adds its own never-opened sessions.
+    if (projectId === DEMO_PROJECT_ID) {
+      const readDemoSessions = loadReadDemoSessions();
+      setUnreadSessionIds((current) => new Set([
+        ...current,
+        ...[DEMO_FIGURE_SESSION_ID, DEMO_LITERATURE_SESSION_ID].filter((sessionId) => !readDemoSessions.has(sessionId)),
+      ]));
+    }
     setDemoHintDismissed(false);
     setTitleReveals(new Map());
     seenTitles.current = new Map();
@@ -5606,15 +5633,24 @@ export function ChatPanel({
   const activeLeafId = activeId ? (state.activeLeafBySession[activeId] ?? null) : null;
   activeLeafRef.current = activeLeafId;
   const messages = useMemo(() => activePath(allMessages, activeLeafId), [allMessages, activeLeafId]);
-  const previousBusySessions = useRef({ projectId, ids: state.busySessions });
+  // Track finished turns in every project the sidebar knows about, not only the
+  // open one, so a session that finishes elsewhere still shows as unread.
+  const knownSessions = new Map<string, ChatSession>();
+  for (const query of projectSessionsQueries) for (const session of query.data ?? []) knownSessions.set(session.id, session);
+  for (const page of flatSessions.data?.pages ?? []) for (const session of page.sessions) knownSessions.set(session.id, session);
+  for (const session of sessions) knownSessions.set(session.id, { ...session, busy: state.busySessions.has(session.id) });
+  const busyEverywhereKey = [...knownSessions.values()].filter((session) => session.busy).map((session) => session.id).sort().join("\n");
+  const knownSessionsRef = useRef(knownSessions);
+  knownSessionsRef.current = knownSessions;
+  const previousBusySessions = useRef<ReadonlySet<string>>(new Set());
   useEffect(() => {
+    const busyNow: ReadonlySet<string> = new Set(busyEverywhereKey ? busyEverywhereKey.split("\n") : []);
     const previous = previousBusySessions.current;
-    previousBusySessions.current = { projectId, ids: state.busySessions };
-    if (previous.projectId !== projectId) return;
+    previousBusySessions.current = busyNow;
     setUnreadSessionIds((current) => unreadAfterBusyChange(
-      current, previous.ids, state.busySessions, sessions, mainView === "chat" ? activeId : null,
+      current, previous, busyNow, [...knownSessionsRef.current.values()], mainView === "chat" ? activeId : null,
     ));
-  }, [projectId, state.busySessions, sessions, activeId, mainView]);
+  }, [busyEverywhereKey, activeId, mainView]);
 
   const busy = activeId ? state.busySessions.has(activeId) : false;
   const canFork = !busy && !!activeHarness?.agentReady;
