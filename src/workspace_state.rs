@@ -19,6 +19,8 @@ pub struct GlobalWorkspaceState {
     pub last_location: Option<String>,
     pub rail_open: bool,
     pub panel_width: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rail_width: Option<f64>,
     pub experiments_view: ExperimentsView,
 }
 
@@ -231,6 +233,9 @@ impl GlobalWorkspaceState {
         if !self.last_location.as_deref().is_none_or(valid_location)
             || !self.panel_width.is_finite()
             || self.panel_width <= 0.0
+            || self
+                .rail_width
+                .is_some_and(|width| !width.is_finite() || width <= 0.0)
         {
             return Err(anyhow!("invalid global workspace state"));
         }
@@ -276,6 +281,7 @@ fn valid_location(location: &str) -> bool {
                             | "harnesses"
                             | "projects"
                             | "compute"
+                            | "openresearch"
                             | "instances"
                             | "environment"
                             | "git"
@@ -306,6 +312,11 @@ fn valid_location(location: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn openresearch_location_is_valid() {
+        assert!(valid_location("/projects/demo/settings/openresearch"));
+    }
 
     #[test]
     fn side_chat_drafts_and_saved_chats_have_valid_workspace_locations() {

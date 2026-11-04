@@ -1,7 +1,9 @@
+import { showConfirmDialog, showCustomDialog } from "../dialog";
 import { Dialog } from "@base-ui/react/dialog";
 import { EscapeScope } from "./EscapeScope";
 import { commandRegion } from "../keyboardRegion";
 import { ComposerProjectPicker } from "./ComposerProjectPicker";
+import { LibraryPicker } from "./LibraryPicker";
 import { ProjectInfoCard } from "./ProjectInfoCard";
 import { SessionHoverCard } from "./SessionHoverCard";
 import { taskLocation } from "../workspaceState";
@@ -12,6 +14,7 @@ import { removeSession as removeCachedSession } from "../queries/invalidation";
 import { nativeOptions, sessionAcpHarness } from "../acp";
 import { resolveHarnessDefaultModel } from "../modelSelection";
 import { setChatConfiguration } from "../api";
+import { RemoteConnectionStrip, useRemoteConnection } from "../RemoteRuntime";
 import {
   isCurrentScope,
   setScopedQueryData,
@@ -29,9 +32,10 @@ import {
   getHarnessesQuery,
   getHarnessSetupCommandsQuery,
   getSkillsQuery,
+  useAlphaXivFolders,
 } from "../queries/settings";
 import { listChatActiveRunsQuery, listChatSessionsQuery, getChatMessagesQuery, listNativeChatsQuery, readSidebarChatPage } from "../queries/chat";
-import { getProjectStarterPromptsQuery, listProjectsQuery, listProjectActivityQuery } from "../queries/projects";
+import { getProjectStarterPromptsQuery, listProjectsQuery, listProjectActivityQuery, resolvePaperQuery } from "../queries/projects";
 import { getCodeTreeQuery } from "../queries/files";
 import {
   fileMentionContext,
@@ -70,7 +74,6 @@ import {
   MessageSquareQuote,
   MessagesSquare,
   MoreHorizontal,
-  PanelLeft,
   Paperclip,
   Pencil,
   Plus,
@@ -138,6 +141,7 @@ import {
   type FirstActionSurface,
   type ChatImageAttachment,
   type ChatMessage,
+  type AlphaXivFolder,
   type ChatPart,
   type Autonomy,
   type ChatSession,
@@ -208,6 +212,8 @@ import { SkillMenu } from "./SkillMenu";
 import { FileMentionMenu } from "./FileMentionMenu";
 import { ComposerSkillChips, MessageWithChips, skillMarginSpaces } from "./SkillChips";
 import { WorkspaceConnection } from "./WorkspaceConnection";
+import { SidebarToggle } from "./Header";
+import { AccountChip } from "./AccountChip";
 import {
   defaultSelection,
   harnessLabel,
@@ -830,6 +836,8 @@ interface ToolActivity {
   kind: ToolActivityKind;
   label: string;
   progressLabel?: string;
+  /** What an approval card asks to do, when the kind's verb alone says too little. */
+  approvalLabel?: string;
   searchPattern?: string;
   filePath?: string;
   fileRef?: string;
@@ -1488,6 +1496,10 @@ function computeToolActivity(part: ChatPart): ToolActivity {
   const filePath = inputString(normalizedInput, "filePath", "file_path", "notebookPath", "notebook_path", "path");
   const description = inputString(normalizedInput, "description");
   if (part.state?.title === "subagent") return { kind: "agent", label: description ?? m.activity_ran_subagent() };
+  const alphaxivTool = [tool, part.state?.title]
+    .map((name) => name?.match(ALPHAXIV_TOOL)?.[1])
+    .find((name) => name != null);
+  if (alphaxivTool) return alphaxivActivity(alphaxivTool.toLowerCase(), normalizedInput);
   const toolSegments = tool.toLowerCase().split(/(?::|\.|__)+/);
   const baseTool = toolSegments.at(-1) ?? tool.toLowerCase();
   if (baseTool === "run" && toolSegments.includes("web")) {
@@ -1836,6 +1848,176 @@ function computeToolActivity(part: ChatPart): ToolActivity {
   }
 }
 
+/** The tool of an alphaXiv MCP call: Claude names it `mcp__alphaxiv__x`, Codex
+ * `alphaxiv:x` (`orx_alphaxiv:x` when the user configured their own `alphaxiv`),
+ * OpenCode `orx_alphaxiv_x`; ACP agents put such a name, or `Tool: alphaxiv/x`,
+ * in the title. Anchored so commands and URLs never match. */
+const ALPHAXIV_TOOL = /^(?:tool: )?(?:mcp__)?(?:orx_)?alphaxiv(?:__|[:/_])([a-z0-9_]+)$/i;
+
+function alphaxivActivity(tool: string, input: Record<string, unknown>): ToolActivity {
+  const row = (kind: ToolActivityKind, label: string, paper?: string, approvalLabel?: string): ToolActivity => ({
+    kind,
+    label,
+    approvalLabel,
+    // Paper arguments may be full titles, which have no page to link.
+    litCall: { kind: "paper", source: "alphaxiv", id: paper && !/\s/.test(paper) ? paper : undefined },
+  });
+  const readPaper = (paper: string | null) =>
+    paper ? m.activity_read_target({ target: ltr(paper) }) : m.activity_read_paper();
+  const forQuery = (activity: string, query: string | null) =>
+    query ? m.activity_for_query({ activity, query }) : activity;
+
+  switch (tool) {
+    case "list_library":
+      return row("read", m.activity_alphaxiv_read_library());
+    case "list_annotated_papers":
+      return row("read", m.activity_alphaxiv_listed_annotated_papers());
+    case "get_paper_notes": {
+      const paper = inputString(input, "paper_id_or_url");
+      const label = paper
+        ? m.activity_alphaxiv_read_notes_on({ paper: ltr(paper) })
+        : m.activity_alphaxiv_read_notes_on_a_paper();
+      return row("read", label, paper ?? undefined);
+    }
+    case "save_papers_to_folder": {
+      const papers = exactInputStringArray(input, "paper_ids_or_urls") ?? [];
+      const only = papers.length === 1 ? papers[0] : undefined;
+      const label = only
+        ? m.activity_alphaxiv_saved_paper({ paper: ltr(only) })
+        : m.activity_alphaxiv_saved_papers({ count: fmtNumber(papers.length) });
+      return row("edit", label, only, alphaxivApprovalLabel(tool, input));
+    }
+    case "create_folder": {
+      const name = inputString(input, "name");
+      return row(
+        "edit",
+        name ? m.activity_alphaxiv_created_folder({ name }) : m.activity_alphaxiv_created_a_folder(),
+        undefined,
+        alphaxivApprovalLabel(tool, input),
+      );
+    }
+    case "answer_pdf_queries": {
+      const paper = inputString(input, "paper");
+      const queries = typeof input.queries === "string" ? [input.queries] : exactInputStringArray(input, "queries") ?? [];
+      const label = queries.length > 1
+        ? m.activity_for_queries({ activity: readPaper(paper), count: fmtNumber(queries.length) })
+        : forQuery(readPaper(paper), queries[0] ?? null);
+      return row("read", label, paper ?? undefined);
+    }
+    case "get_paper_content": {
+      const paper = inputString(input, "url");
+      return row("read", readPaper(paper), paper ?? undefined);
+    }
+    case "read_files_from_github_repository": {
+      const repository = inputString(input, "githubUrl")
+        ?.replace(/^https?:\/\/(?:www\.)?github\.com\//i, "")
+        .replace(/(?:\.git)?\/*$/, "");
+      const path = inputString(input, "path")?.replace(/^\/+/, "");
+      const target = repository && path ? `${repository}/${path}` : repository;
+      return row("read", target ? m.activity_read_target({ target: ltr(target) }) : m.activity_alphaxiv_read_github_repository());
+    }
+    case "discover_papers": {
+      const keywords = exactInputStringArray(input, "keywords") ?? [];
+      const query = inputString(input, "question") ?? (keywords.join(", ") || null);
+      return row("search", forQuery(m.activity_searched_alphaxiv(), query));
+    }
+    case "find_researchers":
+      return row("search", forQuery(m.activity_alphaxiv_searched_researchers(), inputString(input, "topic", "query")));
+    case "get_researcher":
+    case "resolve_researchers": {
+      const count = Array.isArray(input.people)
+        ? input.people.length
+        : exactInputStringArray(input, "researchers")?.length ?? 0;
+      const only = count === 1
+        ? arrayInputString(input, "people", "name") ?? exactInputStringArray(input, "researchers")?.[0]
+        : null;
+      const label = only
+        ? m.activity_alphaxiv_looked_up_researcher({ name: only })
+        : count > 1
+          ? m.activity_alphaxiv_looked_up_researchers({ count: fmtNumber(count) })
+          : m.activity_alphaxiv_looked_up_some_researchers();
+      return row("search", label);
+    }
+    case "get_researcher_papers": {
+      const researchers = exactInputStringArray(input, "researchers") ?? [];
+      const label = researchers.length === 1
+        ? m.activity_alphaxiv_listed_papers_by({ name: researchers[0] })
+        : researchers.length > 1
+          ? m.activity_alphaxiv_listed_papers_by_researchers({ count: fmtNumber(researchers.length) })
+          : m.activity_alphaxiv_listed_researcher_papers();
+      return row("search", label);
+    }
+    case "get_hot_feed":
+      return row("read", m.activity_alphaxiv_checked_trending_papers());
+    default:
+      return row("command", m.activity_used_alphaxiv());
+  }
+}
+
+/** What an alphaXiv write asks to do, naming its folders once `folders` has them. */
+function alphaxivApprovalLabel(
+  tool: string,
+  input: Record<string, unknown>,
+  folders?: AlphaXivFolder[],
+): string | undefined {
+  const folderName = (key: string) => {
+    const id = inputString(input, key);
+    return id ? folders?.find((folder) => folder.id === id)?.name : undefined;
+  };
+
+  switch (tool) {
+    case "save_papers_to_folder": {
+      const papers = exactInputStringArray(input, "paper_ids_or_urls") ?? [];
+      const folder = folderName("folder_id");
+      if (papers.length === 1) {
+        return folder ? m.activity_alphaxiv_save_a_paper_to({ folder }) : m.activity_alphaxiv_save_a_paper();
+      }
+      const count = fmtNumber(papers.length);
+      return folder ? m.activity_alphaxiv_save_papers_to({ count, folder }) : m.activity_alphaxiv_save_papers({ count });
+    }
+    case "create_folder": {
+      const name = inputString(input, "name");
+      const parent = folderName("parent_folder_id");
+      if (!name) return m.activity_alphaxiv_create_a_folder();
+      return parent ? m.activity_alphaxiv_create_folder_in({ name, parent }) : m.activity_alphaxiv_create_folder({ name });
+    }
+  }
+}
+
+/** The body of an alphaXiv write's approval card: what it writes, with each paper linked by title. */
+function AlphaXivApproval({ tool, input }: { tool: string; input: Record<string, unknown> }) {
+  const folders = useAlphaXivFolders().data;
+  const papers = tool === "save_papers_to_folder" ? exactInputStringArray(input, "paper_ids_or_urls") ?? [] : [];
+  const resolved = useQueries({ queries: papers.map((paper) => resolvePaperQuery(paper)) });
+
+  return (
+    <>
+      <div className="prompt-sub text-base font-normal leading-normal text-text wrap-anywhere" dir="auto">
+        {alphaxivApprovalLabel(tool, input, folders)}
+      </div>
+      {papers.length > 0 && (
+        <ul className="m-0 max-h-40 list-none overflow-auto rounded-md border border-border-variant bg-surface px-3 py-1.5">
+          {papers.map((paper, index) => {
+            const title = resolved[index]?.data?.title?.trim();
+            return (
+              <li key={paper} className="flex h-6 items-center gap-2 text-sm text-text">
+                <LitSourceLogo source="alphaxiv" size={14} className="shrink-0" />
+                <span className="flex min-w-0 items-center">
+                  <span className="min-w-0 truncate" dir="auto" title={title}>
+                    <a className="tool-target" href={paperUrl("alphaxiv", paper)} target="_blank" rel="noopener noreferrer">{title || ltr(paper)}</a>
+                  </span>
+                  <ArrowUpRight className="ms-1 shrink-0 opacity-50" size={14} aria-hidden="true" />
+                </span>
+                {title && <span className="shrink-0 text-xs text-subtext">{ltr(paper)}</span>}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </>
+  );
+}
+
 /** Readable one-liner for a Codex sub-agent spawn/activity row, from the
  * collab item fields the backend put in `state.input`. The model-assigned
  * agent name (`nickname`) is the row's identity when present — matching how
@@ -2167,6 +2349,7 @@ function permissionActivityLabel(tool: string | undefined, input: Record<string,
     tool,
     state: { status: "running", input },
   });
+  if (activity.approvalLabel) return activity.approvalLabel;
   return {
     skill: m.activity_load(),
     read: m.activity_read(),
@@ -2801,6 +2984,8 @@ function PromptCard({
     const description = inputString(toolInput, "description") || "";
     const explanation = p.header || reason || description || (summary ? "" : permissionActivityLabel(p.tool, toolInput));
     const headingId = `permission-heading-${part.id}`;
+    const alphaxivTool = p.tool?.match(ALPHAXIV_TOOL)?.[1]?.toLowerCase();
+    const alphaxivWrite = alphaxivTool === "save_papers_to_folder" || alphaxivTool === "create_folder" ? alphaxivTool : null;
     return (
       <div
         className={`prompt-card permission my-3 w-full max-w-2xl overflow-hidden rounded-lg border border-border bg-background [&.readonly]:opacity-60 ${done ? "readonly" : ""}`}
@@ -2814,8 +2999,10 @@ function PromptCard({
           <span id={headingId} className="text-base font-semibold text-text">{m.chat_panel_approval_required()}</span>
         </div>
         <div className="flex flex-col gap-3 px-3.5 py-3">
-          {explanation && <div className="prompt-sub text-base font-normal leading-normal text-text wrap-anywhere">{explanation}</div>}
-          {summary && (
+          {alphaxivWrite
+            ? <AlphaXivApproval tool={alphaxivWrite} input={toolInput} />
+            : explanation && <div className="prompt-sub text-base font-normal leading-normal text-text wrap-anywhere">{explanation}</div>}
+          {summary && !alphaxivWrite && (
             <code className="prompt-command block max-h-36 overflow-auto whitespace-pre-wrap wrap-anywhere rounded-md border border-border-variant bg-surface px-3 py-2 font-mono text-sm leading-relaxed text-text">
               {summary}
             </code>
@@ -4345,7 +4532,7 @@ function SessionRow({
         if (!ref.current?.contains(event.relatedTarget) && !cardRef.current?.contains(event.relatedTarget)) dismissed.current = false;
         scheduleClose();
       }}
-      className={`session-row relative flex items-center gap-2 w-full h-8.5 text-start ps-2.5 pe-1.5 rounded-md text-sm text-text cursor-pointer select-none [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium [&_.session-dot:empty]:hidden [&_.session-dot]:w-4 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:[mask-image:linear-gradient(to_right,black_calc(100%_-_16px),transparent)] [&_.session-title]:whitespace-nowrap [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:w-4 [&_.session-menu-btn]:h-4 [&_.session-menu-btn]:-my-0.5 [&_.session-menu-btn]:mx-0 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-visible_.session-menu-btn]:inline-flex [&_.session-menu-btn:focus-within]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&.card-open_.session-menu-btn]:inline-flex [&:hover_.session-dot]:hidden [&:focus-visible_.session-dot]:hidden [&:has(.session-menu-btn:focus-within)_.session-dot]:hidden [&.menu-open_.session-dot]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-accent-teal [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-accent-green [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:flex-1 [&_.session-title-input]:min-w-0 [&_.session-title-input]:py-px [&_.session-title-input]:px-1 [&_.session-title-input]:-my-0.5 [&_.session-title-input]:mx-0 [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-focus-border [&_.session-title-input]:rounded-sm [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-dot]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""} ${anchor ? "card-open" : ""}  ${
+      className={`session-row relative flex items-center gap-2 w-full h-8.5 text-start ps-2.5 pe-1.5 rounded-md text-sm text-text cursor-pointer select-none [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium [&_.session-dot:empty]:hidden [&_.session-dot]:w-4 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:[mask-image:linear-gradient(to_right,black_calc(100%_-_16px),transparent)] [&_.session-title]:whitespace-nowrap [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:size-6 [&_.session-menu-btn]:-mx-1 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-visible_.session-menu-btn]:inline-flex [&_.session-menu-btn:focus-within]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&.card-open_.session-menu-btn]:inline-flex [&:hover_.session-dot]:hidden [&:focus-visible_.session-dot]:hidden [&:has(.session-menu-btn:focus-within)_.session-dot]:hidden [&.menu-open_.session-dot]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-accent-teal [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-accent-green [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:absolute [&_.session-title-input]:inset-0 [&_.session-title-input]:size-full [&_.session-title-input]:py-0 [&_.session-title-input]:ps-0 [&_.session-title-input]:pe-[9px] [&_.session-title-input]:indent-[9px] [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-focus-border [&_.session-title-input]:rounded-md [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-dot]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""} ${anchor ? "card-open" : ""}  ${
         editing ? "editing" : ""
         }`}
       onClick={() => {
@@ -4560,6 +4747,8 @@ export function ChatPanel({
   contentError = null,
   onRetryContent,
   railHeader,
+  railWidth,
+  onResizeRail,
   railOpen,
   mobileRail = false,
   onCloseMobileRail,
@@ -4597,6 +4786,8 @@ export function ChatPanel({
   onRetryContent?: () => void;
   /** Brand and project creation controls at the top of the rail. */
   railHeader?: React.ReactNode;
+  railWidth?: number;
+  onResizeRail?: (event: React.PointerEvent) => void;
   /** Whether the agents rail is showing (collapsed via its own header icon). */
   railOpen: boolean;
   mobileRail?: boolean;
@@ -4888,7 +5079,8 @@ export function ChatPanel({
   const stickToBottom = useRef(true);
   const [transcriptAtBottom, setTranscriptAtBottom] = useState(true);
   const composerRef = useRef<HTMLTextAreaElement>(null);
-  const [resumeOpen, setResumeOpen] = useState(false);
+  const connection = useRemoteConnection();
+  const resumeCancelRef = useRef<(() => void) | null>(null);
   const dataSources = usePopover();
   const addTranscriptSelection = useCallback((selection: Pick<SelectionAction, "text" | "range">) => {
     setAnnotations((current) => [
@@ -4901,8 +5093,9 @@ export function ChatPanel({
   useAnnotationHighlights(annotations, embedded ? SIDE_CHAT_ANNOTATION_HIGHLIGHT_NAME : CHAT_ANNOTATION_HIGHLIGHT_NAME);
 
   useEffect(() => {
-    setResumeOpen(false);
+    resumeCancelRef.current?.();
     transcriptSelection.dismiss();
+    return () => resumeCancelRef.current?.();
   }, [activeId, projectId, transcriptSelection.dismiss]);
 
   // Slash-skills: menu state is derived from the draft — open while the token
@@ -5379,7 +5572,20 @@ export function ChatPanel({
         } else startNewTask();
         return false;
       case "resume":
-        setResumeOpen(true);
+        showCustomDialog({
+          component: ResumeDialog,
+          props: {
+            activeSessionId: activeId,
+            cancelRef: resumeCancelRef,
+            onResume: (session) => {
+              setSessionFilter("all");
+              onActiveSessionChange(session.id, { projectId: session.projectId });
+            },
+            onImport: (chat) => { void importChat(chat); },
+          },
+          onConfirm: () => {},
+          onCancel: "close",
+        });
         return true;
       case "model":
         setModelPickerRequest((request) => request + 1);
@@ -6558,16 +6764,19 @@ export function ChatPanel({
     });
   }
 
-  async function removeSession(session: ChatSession) {
+  function removeSession(session: ChatSession) {
     const title = session.title?.trim() || m.chat_untitled();
-    if (!window.confirm(m.chat_delete_session_confirm({ title: autoDir(title) }))) return;
-    try {
-      await deleteChatSessionMutation.mutateAsync(session.id);
-    } catch (err) {
-      showAlert(m.chat_delete_session_failed({ title: autoDir(title), error: ltr(err instanceof Error ? err.message : String(err)) }), "error");
-      return;
-    }
-    forgetSession(session.id);
+    showConfirmDialog({
+      title: m.chat_panel_delete(),
+      description: m.chat_delete_session_confirm({ title: autoDir(title) }),
+      confirmLabel: m.chat_panel_delete(),
+      destructive: true,
+      onCancel: "close",
+      onConfirm: async () => {
+        await deleteChatSessionMutation.mutateAsync(session.id);
+        forgetSession(session.id);
+      },
+    });
   }
 
   /** Deliver a card answer; resolves `false` when delivery failed (so a
@@ -6724,7 +6933,11 @@ export function ChatPanel({
   }, [sidebarGrouping, railOpen, embedded, lastVisibleIndex, sidebarRows.length, flatSessions.hasNextPage, flatSessions.isFetching, flatSessions.isError, flatSessions.fetchNextPage]);
 
   const rail = (
-    <aside className="session-rail w-75 shrink-0 flex flex-col bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:pt-0 [&_.rail-body]:pb-0 [&_.rail-body]:ps-2 [&_.rail-body]:pe-1 border-e border-e-border overflow-visible">
+    <aside style={mobileRail ? undefined : { width: railWidth }} className="session-rail relative shrink-0 flex flex-col bg-background min-h-0 [&_.rail-body]:flex-1 [&_.rail-body]:min-h-0 [&_.rail-body]:pt-0 [&_.rail-body]:pb-0 [&_.rail-body]:ps-2 [&_.rail-body]:pe-1 border-e border-e-border overflow-visible">
+      {!mobileRail && <div
+        className="rail-resizer absolute -end-1 top-0 bottom-0 w-1.5 z-30 cursor-col-resize [&:hover]:bg-resizer-hover [&:active]:bg-resizer-hover"
+        onPointerDown={onResizeRail}
+      />}
       {railHeader}
       <nav data-keyboard-list onKeyDown={navigateKeyboardList} className="rail-nav flex flex-col gap-0.5 p-2 shrink-0 [&_[data-tip]::after]:left-[calc(100%_+_6px)] [&_[data-tip]::after]:top-1/2 [&_[data-tip]::after]:translate-x-0 [&_[data-tip]::after]:-translate-y-1/2">
         <button
@@ -6769,11 +6982,11 @@ export function ChatPanel({
           );
         })}
       </nav>
-      <div className="rail-section-head flex items-center justify-between shrink-0 pt-3.5 pe-2.5 pb-0 ps-4.5">
+      <div className="rail-section-head flex items-center justify-between shrink-0 pt-3.5 pe-3.5 pb-0 ps-4.5">
         <div className="rail-section-label p-0 text-sm font-medium text-subtext">
           {sidebarGrouping === "projects" ? m.projects_home_projects() : m.chat_all_sessions()}
         </div>
-        <div className="rail-section-actions flex items-center gap-0.5">
+        <div className="rail-section-actions flex items-center gap-1">
           {onNewProject && <Tooltip interactive content={m.projects_home_new_project()} className="rounded-sm">
             <IconButton size="small" className="text-subtext" aria-label={m.projects_home_new_project()} onClick={onNewProject}>
               <FolderPlus size={16} className="text-subtext" />
@@ -6884,8 +7097,7 @@ export function ChatPanel({
                         void navigate({ href: taskLocation(targetProjectId, targetProjectId === s.projectId ? s.id : null, { kind: "experiment", experimentId, view: "overview" }) });
                       }}
                       onOpen={() => {
-                        if (project.id === projectId) onActiveSessionChange(s.id);
-                        else void navigate({ to: "/projects/$projectId/tasks/$sessionId", params: { projectId: project.id, sessionId: s.id } });
+                        onActiveSessionChange(s.id, { projectId: project.id });
                         if (project.id === DEMO_PROJECT_ID) {
                           markDemoSessionRead(s.id);
                           const experiment = DEMO_EXPERIMENT_LABELS[s.id];
@@ -6951,7 +7163,7 @@ export function ChatPanel({
         <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 bottom-0 z-5 h-3 bg-linear-to-t from-background to-transparent" />
       </>}
       </div>
-      <WorkspaceConnection runtime={runtime} />
+      <div className="flex shrink-0 items-center gap-1 border-t border-border px-1 py-1"><AccountChip onDetails={() => onSelectMainView("openresearch")} /><WorkspaceConnection runtime={runtime} /></div>
     </aside>
   );
 
@@ -6964,17 +7176,9 @@ export function ChatPanel({
       </Dialog.Portal>
     </Dialog.Root>
   ) : railOpen ? rail : null;
+  // Sits exactly where the open sidebar's toggle does; in the macOS app it only holds the titlebar toggle's place.
   const railReopen = (!railOpen || mobileRail) && !embedded && (
-    <Tooltip interactive content={`${m.chat_panel_show_sidebar()} (${formatForDisplay(appHotkeys["sidebar.toggle"].hotkey ?? [])})`} className="rounded-md mac-titlebar:invisible">
-      <IconButton
-        aria-label={m.chat_panel_show_sidebar()}
-        aria-expanded={railOpen}
-        onClick={onShowRail}
-        className="mac-titlebar:ms-titlebar-inset"
-      >
-        <PanelLeft size={20} />
-      </IconButton>
-    </Tooltip>
+    <SidebarToggle open={false} onClick={onShowRail} className="ms-2.5 max-md:ms-1 mac-titlebar:invisible mac-titlebar:ms-titlebar-inset" />
   );
 
   if (mainView !== "chat") {
@@ -6999,7 +7203,7 @@ export function ChatPanel({
       <section inert={contentInert} data-side-chat={embedded || undefined} className="chat-pane flex-1 min-w-0 flex flex-col bg-background min-h-0">
         {/* Header — session title on the left, end-pane view switchers on the
           right, fading into the chat below (sessions live in the rail). */}
-        <div className={railOpen && !mobileRail || embedded ? "contents" : "chat-heading-row grid shrink-0 grid-cols-[2rem_minmax(0,1fr)_2rem] mac-titlebar:grid-cols-titlebar-chat items-center"}>
+        <div className={railOpen && !mobileRail || embedded ? "contents" : "chat-heading-row grid shrink-0 grid-cols-[2.625rem_minmax(0,1fr)_2.625rem] mac-titlebar:grid-cols-titlebar-chat items-center"}>
           {railReopen}
           <div className={headerClass}>
           <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -7087,7 +7291,7 @@ export function ChatPanel({
               </>
             )}
             {starterPrompts && starterPrompts.length > 0 && (
-              <div className={STARTER_GRID_CLASS} role="group" aria-label={m.chat_panel_starter_prompts()}>
+              <div className={STARTER_GRID_CLASS} role="group" aria-label={m.chat_panel_starter_prompts()} inert={connection !== null}>
                 {starterPrompts.map((item, index) => {
                   const Icon = STARTER_ICONS[index];
                   const tone = STARTER_TONES[index];
@@ -7203,7 +7407,7 @@ export function ChatPanel({
         )}
 
         {pendingQuestions.length > 0 && (
-          <div inert={contentLoading || Boolean(contentError) || historyLoading} className="mx-auto mb-2 flex max-h-96 w-full max-w-readable shrink-0 flex-col gap-2 overflow-y-auto px-3">
+          <div inert={contentLoading || Boolean(contentError) || historyLoading || connection !== null} className="mx-auto mb-2 flex max-h-96 w-full max-w-readable shrink-0 flex-col gap-2 overflow-y-auto px-3">
             {pendingQuestions.map((part) => <PromptCard key={`${activeId}-${part.id}`} part={part} onRespond={respond} />)}
           </div>
         )}
@@ -7362,7 +7566,8 @@ export function ChatPanel({
               }}
             />
           )}
-          <div className={`composer-box relative flex flex-col border ${bashMode ? "border-accent-amber" : "border-border"} rounded-lg bg-background shadow-control-subtle`} data-onboarding="composer">
+          <RemoteConnectionStrip />
+          <div inert={connection !== null} className={`composer-box relative flex flex-col border ${bashMode ? "border-accent-amber" : "border-border"} rounded-lg bg-background shadow-control-subtle${connection ? " opacity-60" : ""}`} data-onboarding="composer">
             {unconfirmedSend !== null && (
               <div id={unconfirmedSendId} role="alert" className="flex items-start gap-2 pt-2 px-3 text-sm text-text">
                 <span className="flex-1" dir="auto">{m.chat_send_unconfirmed({ error: ltr(unconfirmedSend) })}</span>
@@ -7409,21 +7614,6 @@ export function ChatPanel({
                 activeIndex={activeMentionIdx}
                 onPick={pickFileMention}
                 onHover={setMentionIdx}
-              />
-            )}
-            {resumeOpen && (
-              <ResumeDialog
-                activeSessionId={activeId}
-                onClose={() => setResumeOpen(false)}
-                onResume={(session) => {
-                  setResumeOpen(false);
-                  setSessionFilter("all");
-                  onActiveSessionChange(session.id, { projectId: session.projectId });
-                }}
-                onImport={(chat) => {
-                  setResumeOpen(false);
-                  void importChat(chat);
-                }}
               />
             )}
             {annotations.length > 0 && (
@@ -7658,6 +7848,17 @@ export function ChatPanel({
                   <Paperclip size={16} />
                 </IconButton>
               </Tooltip>
+              <LibraryPicker composerRef={composerRef} onAdd={(papers) => {
+                const references = papers.map((paper) => `${paper.title}\n${paper.url}`).join("\n\n");
+                const prefix = draft.trim() ? `${draft.trimEnd()}\n\n` : "";
+                const next = `${prefix}${references}\n\n`;
+                setDraft(next);
+                window.requestAnimationFrame(() => {
+                  composerRef.current?.focus();
+                  composerRef.current?.setSelectionRange(next.length, next.length);
+                  setComposerCursor(next.length);
+                });
+              }} />
               {(sessionGoal || goalArmed) && (
                 <Tooltip interactive content={goalArmed ? m.goal_command_description() : m.chat_panel_clear_goal({ goal: autoDir(sessionGoal) })}>
                   <Button
