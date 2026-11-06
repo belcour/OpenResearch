@@ -20,6 +20,7 @@ const STATES = path.join(DEV, 'states')
 const WINDOWS = process.platform === 'win32'
 const EXE = WINDOWS ? '.exe' : ''
 const BINARY = path.join(DEV, 'bin', `orx${EXE}`)
+const HOST_BINARIES = path.join(ROOT, 'target', 'host-binaries')
 const SERVER_LOG = path.join(DEV, 'server.log')
 const WORKTREE_HASH = createHash('sha256').update(ROOT).digest()
 /**
@@ -86,6 +87,8 @@ const env = {
   ORX_DATA_DIR: path.join(LIVE, 'data'),
   XDG_CONFIG_HOME: path.join(LIVE, 'config'),
   ORX_CACHE_DIR: path.join(DEV, 'cache'),
+  // Development builds do not embed orx-host, which scripts/build-host.mjs writes here.
+  ORX_HOST_BIN_DIR: process.env.ORX_HOST_BIN_DIR ?? HOST_BINARIES,
 }
 
 const SOURCES = ['api', 'web', 'app', 'build'] as const
