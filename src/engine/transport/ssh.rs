@@ -168,7 +168,7 @@ pub(super) async fn master_alive(config: &Config, path: &Path) -> Result<bool> {
                 "-o",
                 "BatchMode=yes",
                 "-o",
-                "ProxyCommand=false",
+                "ProxyCommand=none",
                 "--",
                 &config.alias,
             ])
@@ -307,7 +307,7 @@ fn session_command(
             command
                 .arg("-S")
                 .arg(socket(config, route)?)
-                .args(["-o", "ProxyCommand=false"]);
+                .args(["-o", "ProxyCommand=none"]);
         } else {
             command.args(["-o", "ControlPath=none"]);
         }

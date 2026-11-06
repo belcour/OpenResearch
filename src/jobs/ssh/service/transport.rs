@@ -136,7 +136,7 @@ pub(super) async fn connect(
         #[cfg(unix)]
         {
             command
-                .args(["-oBatchMode=yes", "-oProxyCommand=false", "-S"])
+                .args(["-oBatchMode=yes", "-oProxyCommand=none", "-S"])
                 .arg(
                     resolved
                         .socket

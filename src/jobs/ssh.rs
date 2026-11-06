@@ -562,7 +562,7 @@ async fn master_accepts_sessions(
             "-oBatchMode=yes",
             "-oControlMaster=no",
             "-oControlPersist=no",
-            "-oProxyCommand=false",
+            "-oProxyCommand=none",
             "-oClearAllForwardings=yes",
             "-oRemoteCommand=none",
             "-T",

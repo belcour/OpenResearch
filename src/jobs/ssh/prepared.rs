@@ -532,7 +532,7 @@ mod tests {
         let output = crate::process::tokio_command("ssh")
             .args(["-vvv", "-F"])
             .arg(&prepared.snapshot)
-            .args(["-oProxyCommand=false", "-oBatchMode=yes", "lab", "true"])
+            .args(["-oProxyCommand=none", "-oBatchMode=yes", "lab", "true"])
             .output()
             .await
             .unwrap();
