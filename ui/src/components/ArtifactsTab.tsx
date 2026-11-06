@@ -39,6 +39,7 @@ import {
   type FileContextMenuTarget,
 } from "./FileTreeActions";
 import { IconButton, IconButtonLink, LoadingRow, showAlert, Spinner } from "./ui";
+import { downloadUrl } from "../download";
 
 /** Drop a leading YAML frontmatter block so it doesn't render as markdown. */
 function stripFrontmatter(md: string): string {
@@ -49,7 +50,7 @@ function stripFrontmatter(md: string): string {
 
 /** Tree pane width: draggable divider, persisted across reloads. */
 const TREE_WIDTH_KEY = "orx:files-tree-width";
-const COLLAPSED_DIRS_KEY_PREFIX = "orx:artifacts-collapsed:";
+const EXPANDED_DIRS_KEY_PREFIX = "orx:artifacts-expanded:";
 const TREE_MIN_WIDTH = 180;
 const TREE_MAX_WIDTH = 320;
 const TREE_MAX_INDENT_DEPTH = 8;
@@ -65,9 +66,9 @@ function initialTreeWidth(): number {
   return TREE_DEFAULT_WIDTH;
 }
 
-function initialCollapsed(projectId: string): Set<string> {
+function initialExpanded(projectId: string): Set<string> {
   try {
-    const raw = localStorage.getItem(`${COLLAPSED_DIRS_KEY_PREFIX}${projectId}`);
+    const raw = localStorage.getItem(`${EXPANDED_DIRS_KEY_PREFIX}${projectId}`);
     if (!raw) return new Set();
     const value: unknown = JSON.parse(raw);
     if (!Array.isArray(value)) return new Set();
@@ -336,7 +337,7 @@ function PreviewPane({
 function TreeRows({
   entries,
   depth,
-  collapsed,
+  expanded,
   selected,
   onToggle,
   onSelect,
@@ -349,7 +350,7 @@ function TreeRows({
 }: {
   entries: ArtifactEntry[];
   depth: number;
-  collapsed: Set<string>;
+  expanded: Set<string>;
   selected: string | null;
   onToggle: (path: string) => void;
   onSelect: (path: string) => void;
@@ -367,10 +368,25 @@ function TreeRows({
       {entries.map((e) => {
         const indent = { paddingInlineStart: 8 + Math.min(depth, TREE_MAX_INDENT_DEPTH) * 14 };
         if (e.isDir) {
-          const open = !collapsed.has(e.path);
+          const open = expanded.has(e.path);
           return (
             <div key={e.path} className="min-w-0 max-w-full">
-              <div className="file-tree-row flex w-full min-w-0 items-center gap-1.5 py-1 px-2.5 border-0 bg-transparent text-text text-start cursor-pointer font-[inherit] [&:hover]:bg-panel [&_>_svg]:shrink-0 [&_>_svg]:text-subtext [&_>_svg.file-tree-chevron]:text-muted artifact-tree-row [&.selected]:bg-panel [&.selected:hover]:bg-panel [&:hover_.ft-row-delete]:opacity-100" style={indent} onClick={() => onToggle(e.path)}>
+              <div
+                className="file-tree-row flex w-full min-w-0 items-center gap-1.5 py-1 px-2.5 border-0 bg-transparent text-text text-start cursor-pointer font-[inherit] [&:hover]:bg-panel [&_>_svg]:shrink-0 [&_>_svg]:text-subtext [&_>_svg.file-tree-chevron]:text-muted artifact-tree-row [&.selected]:bg-panel [&.selected:hover]:bg-panel [&:hover_.ft-row-delete]:opacity-100"
+                style={indent}
+                onClick={() => onToggle(e.path)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  onContextMenu(event, e.path);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "ContextMenu" || matchesKeyboardEvent(event.nativeEvent, "Shift+F10")) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    onContextMenu(event, e.path);
+                  }
+                }}
+              >
                 <button
                   data-keyboard-item
                   data-keyboard-path={e.path}
@@ -409,7 +425,7 @@ function TreeRows({
                 <TreeRows
                   entries={e.children ?? []}
                   depth={depth + 1}
-                  collapsed={collapsed}
+                  expanded={expanded}
                   selected={selected}
                   onToggle={onToggle}
                   onSelect={onSelect}
@@ -514,14 +530,14 @@ export function ArtifactsTab({
 }) {
   const { showConfirmDialog } = useWorkspace().dialogs;
 
-  const { deleteArtifact, manageArtifactFile, revealArtifactInManager } = useWorkspace().api;
+  const { deleteArtifact, manageArtifactFile, revealArtifactInManager, artifactArchiveUrl } = useWorkspace().api;
 
   const runtime = useRuntime();
   const storageProjectId = runtime.kind === "ssh" ? `${encodeURIComponent(runtime.session.host)}:${project.id}` : project.id;
   const [selected, setSelected] = useState<string | null>(null);
-  // Folders are open by default — including ones that appear later — so this
-  // tracks what the user closed instead.
-  const [collapsed, setCollapsed] = useState<Set<string>>(() => initialCollapsed(storageProjectId));
+  // Folders are collapsed by default — including ones that appear later — so
+  // this tracks what the user expanded instead.
+  const [expanded, setExpanded] = useState<Set<string>>(() => initialExpanded(storageProjectId));
   const [treeWidth, setTreeWidth] = useState(initialTreeWidth);
   const [contextMenu, setContextMenu] = useState<FileContextMenuTarget | null>(null);
   const [renamingPath, setRenamingPath] = useState<string | null>(null);
@@ -529,13 +545,13 @@ export function ArtifactsTab({
   useEffect(() => {
     try {
       localStorage.setItem(
-        `${COLLAPSED_DIRS_KEY_PREFIX}${storageProjectId}`,
-        JSON.stringify([...collapsed]),
+        `${EXPANDED_DIRS_KEY_PREFIX}${storageProjectId}`,
+        JSON.stringify([...expanded]),
       );
     } catch {
       // best-effort persistence
     }
-  }, [storageProjectId, collapsed]);
+  }, [storageProjectId, expanded]);
 
   // Drag the divider to resize the tree pane; width persists across reloads.
   // Mirrors App's end-panel resizer: capture the pointer so views under the
@@ -575,7 +591,7 @@ export function ArtifactsTab({
   }, [selected, artifacts]);
 
   const toggle = (path: string) =>
-    setCollapsed((prev) => {
+    setExpanded((prev) => {
       const next = new Set(prev);
       if (next.has(path)) next.delete(path);
       else next.add(path);
@@ -625,7 +641,7 @@ export function ArtifactsTab({
     <TreeRows
       entries={entries}
       depth={0}
-      collapsed={collapsed}
+      expanded={expanded}
       selected={selected}
       onToggle={toggle}
       onSelect={setSelected}
@@ -643,6 +659,8 @@ export function ArtifactsTab({
     />
   );
   const selectedEntry = selected ? findArtifactEntry(artifacts.entries, selected) : null;
+  const contextMenuEntry = contextMenu ? findArtifactEntry(artifacts.entries, contextMenu.path) : null;
+  const contextMenuIsFolder = contextMenuEntry?.isDir ?? false;
 
   if (artifacts.entries.length === 0) {
     return (
@@ -684,14 +702,21 @@ export function ArtifactsTab({
       {contextMenu && (
         <FileContextMenu
           target={contextMenu}
-          onOpen={() => onOpenFile(contextMenu.path)}
+          folder={contextMenuIsFolder}
+          onDownload={contextMenuIsFolder
+            ? () => {
+              const folderName = contextMenu.path.split("/").pop() ?? "archive";
+              downloadUrl(artifactArchiveUrl(project.id, contextMenu.path), `${folderName}.zip`);
+            }
+            : undefined}
+          onOpen={contextMenuIsFolder ? undefined : () => onOpenFile(contextMenu.path)}
           onReveal={remote ? undefined : () => void reveal(contextMenu.path)}
-          onRename={canRenameFile(contextMenu.path) ? () => setRenamingPath(contextMenu.path) : undefined}
-          onDuplicate={() => void manage(contextMenu.path, { action: "duplicate" })}
+          onRename={!contextMenuIsFolder && canRenameFile(contextMenu.path) ? () => setRenamingPath(contextMenu.path) : undefined}
+          onDuplicate={!contextMenuIsFolder ? () => void manage(contextMenu.path, { action: "duplicate" }) : undefined}
           onCopyPath={() => copyPath(contextMenu.path)}
           onDelete={() => {
             showConfirmDialog({
-              title: m.artifacts_tab_delete_artifact(),
+              title: contextMenuIsFolder ? m.artifacts_tab_delete_folder() : m.artifacts_tab_delete_artifact(),
               description: m.artifact_delete_confirm({ path: ltr(contextMenu.path) }),
               destructive: true,
               confirmLabel: m.chat_panel_delete(),

@@ -42,6 +42,7 @@
   "file_tree_delete_confirm": "¿Eliminar “{path}”? Esta acción no se puede deshacer.",
   "file_tree_duplicate": "Duplicar",
   "file_tree_file_actions": "Acciones de archivo para {path}",
+  "file_tree_folder_actions": "Acciones de carpeta para {path}",
   "file_tree_open": "Abrir",
   "file_tree_rename_file": "Renombrar {path}",
   "file_tree_clipboard_unavailable": "El acceso al portapapeles no está disponible.",

@@ -42,6 +42,7 @@
   "file_tree_delete_confirm": "Удалить «{path}»? Это действие нельзя отменить.",
   "file_tree_duplicate": "Дублировать",
   "file_tree_file_actions": "Действия с файлом {path}",
+  "file_tree_folder_actions": "Действия с папкой {path}",
   "file_tree_open": "Открыть",
   "file_tree_rename_file": "Переименовать {path}",
   "file_tree_clipboard_unavailable": "Доступ к буферу обмена недоступен.",

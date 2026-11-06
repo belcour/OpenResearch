@@ -42,6 +42,7 @@
   "file_tree_delete_confirm": "{path} silinsin mi? Bu işlem geri alınamaz.",
   "file_tree_duplicate": "Çoğalt",
   "file_tree_file_actions": "{path} için dosya işlemleri",
+  "file_tree_folder_actions": "{path} için klasör işlemleri",
   "file_tree_open": "Aç",
   "file_tree_rename_file": "{path} dosyasını yeniden adlandır",
   "file_tree_clipboard_unavailable": "Panoya erişilemiyor.",

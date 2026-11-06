@@ -83,9 +83,10 @@ export interface FileContextMenuTarget {
   y: number;
 }
 
+// `Element`-wide: the artifacts tree opens the menu from a folder row, not just a button.
 export type FileContextMenuEvent =
-  | ReactMouseEvent<HTMLButtonElement>
-  | ReactKeyboardEvent<HTMLButtonElement>;
+  | ReactMouseEvent<Element>
+  | ReactKeyboardEvent<Element>;
 
 export function fileContextMenuTarget(
   event: FileContextMenuEvent,
@@ -109,15 +110,21 @@ export function FileContextMenu({
   onCopyPath,
   onReveal,
   onDelete,
+  onDownload,
+  folder = false,
   onClose,
 }: {
   target: FileContextMenuTarget;
-  onOpen: () => void;
+  onOpen?: () => void;
   onRename?: () => void;
   onDuplicate?: () => void;
   onCopyPath: () => void;
   onReveal?: () => void;
   onDelete?: () => void;
+  /** Download the entry as an archive; only offered for folders. */
+  onDownload?: () => void;
+  /** The target is a folder: no open/rename/duplicate, and the label says folder. */
+  folder?: boolean;
   onClose: () => void;
 }) {
   const { portalContainer } = useContext(WorkspaceDomContext);
@@ -156,11 +163,14 @@ export function FileContextMenu({
           >
             <Menu.Popup
               ref={menuRef}
-              aria-label={m.file_tree_file_actions({ path: ltr(target.path) })}
+              aria-label={folder
+                ? m.file_tree_folder_actions({ path: ltr(target.path) })
+                : m.file_tree_file_actions({ path: ltr(target.path) })}
               className="outline-none option-menu min-w-44 max-h-(--available-height) overflow-y-auto rounded-md border border-border bg-background p-1 shadow-menu"
               onContextMenu={(event) => event.preventDefault()}
             >
-              <Menu.Item nativeButton render={<MenuItem size="compact" className="data-highlighted:bg-surface" />} onClick={onOpen}>{m.file_tree_open()}</Menu.Item>
+              {onDownload && <Menu.Item nativeButton render={<MenuItem size="compact" className="data-highlighted:bg-surface" />} onClick={onDownload}>{m.file_viewer_download()}</Menu.Item>}
+              {!folder && onOpen && <Menu.Item nativeButton render={<MenuItem size="compact" className="data-highlighted:bg-surface" />} onClick={onOpen}>{m.file_tree_open()}</Menu.Item>}
               {onReveal && <Menu.Item nativeButton render={<MenuItem size="compact" className="data-highlighted:bg-surface" />} onClick={onReveal}>{revealLabel}</Menu.Item>}
               {onRename && <Menu.Item nativeButton render={<MenuItem size="compact" className="data-highlighted:bg-surface" />} onClick={onRename}>{m.chat_panel_rename()}</Menu.Item>}
               {onDuplicate && <Menu.Item nativeButton render={<MenuItem size="compact" className="data-highlighted:bg-surface" />} onClick={onDuplicate}>{m.file_tree_duplicate()}</Menu.Item>}

@@ -42,6 +42,7 @@
   "file_tree_delete_confirm": "“{path}”을(를) 삭제할까요? 되돌릴 수 없습니다.",
   "file_tree_duplicate": "복제",
   "file_tree_file_actions": "{path} 파일 작업",
+  "file_tree_folder_actions": "{path} 폴더 작업",
   "file_tree_open": "열기",
   "file_tree_rename_file": "{path} 이름 변경",
   "file_tree_clipboard_unavailable": "클립보드에 접근할 수 없습니다.",

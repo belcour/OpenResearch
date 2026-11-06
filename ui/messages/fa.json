@@ -42,6 +42,7 @@
   "file_tree_delete_confirm": "«{path}» حذف شود؟ این کار قابل بازگشت نیست.",
   "file_tree_duplicate": "ایجاد نسخهٔ تکراری",
   "file_tree_file_actions": "عملیات فایل برای {path}",
+  "file_tree_folder_actions": "عملیات پوشه برای {path}",
   "file_tree_open": "باز کردن",
   "file_tree_rename_file": "تغییر نام {path}",
   "file_tree_clipboard_unavailable": "دسترسی به کلیپ‌بورد در دسترس نیست.",

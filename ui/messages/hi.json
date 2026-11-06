@@ -42,6 +42,7 @@
   "file_tree_delete_confirm": "“{path}” हटाएं? इसे वापस नहीं लाया जा सकता।",
   "file_tree_duplicate": "डुप्लिकेट करें",
   "file_tree_file_actions": "{path} के लिए फ़ाइल क्रियाएं",
+  "file_tree_folder_actions": "{path} के लिए फ़ोल्डर क्रियाएँ",
   "file_tree_open": "खोलें",
   "file_tree_rename_file": "{path} का नाम बदलें",
   "file_tree_clipboard_unavailable": "क्लिपबोर्ड एक्सेस उपलब्ध नहीं है।",

@@ -42,6 +42,7 @@
   "file_tree_delete_confirm": "Usunąć „{path}”? Tej operacji nie można cofnąć.",
   "file_tree_duplicate": "Duplikuj",
   "file_tree_file_actions": "Operacje na pliku {path}",
+  "file_tree_folder_actions": "Operacje na folderze {path}",
   "file_tree_open": "Otwórz",
   "file_tree_rename_file": "Zmień nazwę pliku {path}",
   "file_tree_clipboard_unavailable": "Schowek jest niedostępny.",

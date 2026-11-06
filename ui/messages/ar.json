@@ -42,6 +42,7 @@
   "file_tree_delete_confirm": "حذف «{path}»؟ لا يمكن التراجع عن هذا الإجراء.",
   "file_tree_duplicate": "تكرار",
   "file_tree_file_actions": "إجراءات الملف لـ {path}",
+  "file_tree_folder_actions": "إجراءات المجلد لـ {path}",
   "file_tree_open": "فتح",
   "file_tree_rename_file": "إعادة تسمية {path}",
   "file_tree_clipboard_unavailable": "الوصول إلى الحافظة غير متاح.",

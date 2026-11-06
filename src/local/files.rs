@@ -11,6 +11,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -25,6 +26,10 @@ const IGNORED: &[&str] = &[".DS_Store", "Thumbs.db"];
 
 /// Listing cap — a runaway directory shouldn't stall the 2Hz event loop.
 const MAX_ENTRIES: usize = 2000;
+
+/// Cap on uncompressed bytes a folder zip may carry, so a huge `data` folder
+/// can't fill the temporary export with an unbounded copy.
+pub const MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// `<data dir>/files/`. The physical name stays stable for compatibility even
 /// though the product surface is called Artifacts. A pre-v0.1.48 `artifacts/`
@@ -404,6 +409,16 @@ pub(super) fn is_ignored(name: &str) -> bool {
     name.starts_with('.') || IGNORED.contains(&name)
 }
 
+/// Tree order: directories above files — a file wedged between two folders
+/// reads as a folder list — then newest first, and by name when mtimes tie.
+fn entry_order(a: &ArtifactEntry, b: &ArtifactEntry) -> std::cmp::Ordering {
+    b.is_dir.cmp(&a.is_dir).then_with(|| {
+        b.modified_at
+            .cmp(&a.modified_at)
+            .then_with(|| a.name.cmp(&b.name))
+    })
+}
+
 /// Recursively build the tree under `dir`, counting nodes against
 /// `MAX_ENTRIES`. Returns (children, hit_cap). Symlinks resolving outside
 /// `canonical_base` are skipped — the serve endpoints would refuse them.
@@ -460,7 +475,7 @@ fn collect_tree(
             });
         }
     }
-    out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+    out.sort_by(entry_order);
     (out, truncated)
 }
 
@@ -481,6 +496,173 @@ pub fn list(project: &LocalProject) -> Result<ArtifactsListing> {
 /// A contained artifact path suitable for streaming without buffering.
 pub fn file_path(project: &LocalProject, rel_path: &str) -> Result<PathBuf> {
     resolve_contained(&files_dir(project), rel_path)
+}
+
+/// Why a folder can't be zipped; each variant has its own call-site message.
+#[derive(Debug)]
+pub enum ArchiveError {
+    /// More than `MAX_ENTRIES` files — beyond that, the listing shows a truncated tree.
+    TooMany,
+    /// Uncompressed contents over `MAX_ARCHIVE_BYTES`; the total at the overflow, not the zip size.
+    TooLarge(u64),
+    /// An I/O or zip-writer failure, with the path it hit.
+    Other(crate::error::Error),
+}
+
+/// Binary sizes in the familiar unit names, as the dashboard shows them: "3.97 GB", "64 MB".
+pub fn human_size(bytes: u64) -> String {
+    for (unit, size) in [
+        ("GB", 1024u64.pow(3)),
+        ("MB", 1024u64.pow(2)),
+        ("KB", 1024),
+        ("B", 1),
+    ] {
+        if bytes >= size {
+            let value = bytes as f64 / size as f64;
+            return if value < 10.0 {
+                format!("{value:.2} {unit}")
+            } else {
+                format!("{value:.0} {unit}")
+            };
+        }
+    }
+    "0 B".into()
+}
+
+/// Write the contents of `root` to `path` as a zip. Each file's entry name is
+/// relative to `root`, so a folder's children sit at the archive's root rather
+/// than in a wrapper folder. Symlinks that resolve outside `root` are skipped
+/// exactly like the listing; the walk refuses unreadable folders instead of
+/// dropping them, so a zip is never quietly missing files.
+pub fn archive_dir(root: &Path, path: &Path) -> std::result::Result<(), ArchiveError> {
+    let root = crate::paths::canonicalize(root)
+        .map_err(|e| ArchiveError::Other(anyhow!("Could not resolve {}: {}", root.display(), e)))?;
+    if !root.is_dir() {
+        return Err(ArchiveError::Other(anyhow!(
+            "\"{}\" is not a folder",
+            root.display()
+        )));
+    }
+    // Count against the caps before writing anything, so a cap-bound folder
+    // pays no cost in a partial zip.
+    let mut entries: Vec<(PathBuf, String, u64)> = Vec::new();
+    collect_archive_entries(&root, &root, "", &mut entries)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ArchiveError::Other(anyhow!("Could not create {}: {}", parent.display(), e))
+        })?;
+    }
+    // Renamed into place, so a failed export never leaves a half file under the real name.
+    let partial = path.with_file_name(format!(
+        "{}.part",
+        path.file_name()
+            .ok_or_else(|| ArchiveError::Other(anyhow!("archive path has no name")))?
+            .to_string_lossy()
+    ));
+    let result = (|| -> std::result::Result<(), ArchiveError> {
+        let file = std::fs::File::create(&partial).map_err(|e| {
+            ArchiveError::Other(anyhow!("Could not create {}: {e}", partial.display()))
+        })?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default().large_file(true);
+        for (file, name, size) in &entries {
+            // Deflates what benefits and stores the rest, as in `.orx` bundles.
+            let method = if *size == 0 {
+                zip::CompressionMethod::Stored
+            } else {
+                zip::CompressionMethod::Deflated
+            };
+            zip.start_file(name.as_str(), options.compression_method(method))
+                .map_err(|e| {
+                    ArchiveError::Other(anyhow!("Could not add {name} to the archive: {e}"))
+                })?;
+            std::io::copy(
+                &mut std::fs::File::open(file).map_err(|e| {
+                    ArchiveError::Other(anyhow!("Could not read {}: {e}", file.display()))
+                })?,
+                &mut zip,
+            )
+            .map_err(|e| {
+                ArchiveError::Other(anyhow!("Could not add {name} to the archive: {e}"))
+            })?;
+        }
+        zip.finish()
+            .map_err(|e| ArchiveError::Other(anyhow!("Could not finish {}: {e}", path.display())))?
+            .flush()
+            .map_err(|e| {
+                ArchiveError::Other(anyhow!("Could not finish {}: {e}", path.display()))
+            })?;
+        std::fs::rename(&partial, path).map_err(|e| {
+            ArchiveError::Other(anyhow!("Could not finish {}: {e}", path.display()))
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    result
+}
+
+/// Pass 1 of [`archive_dir`] — gather files against the caps, visiting each
+/// level in `entry_order` so the zip takes what the listing shows, in the
+/// order it shows it.
+fn collect_archive_entries(
+    root: &Path,
+    dir: &Path,
+    prefix: &str,
+    entries: &mut Vec<(PathBuf, String, u64)>,
+) -> std::result::Result<u64, ArchiveError> {
+    let mut total = 0;
+    let read_dir = std::fs::read_dir(dir)
+        .map_err(|e| ArchiveError::Other(anyhow!("Could not read {}: {e}", dir.display())))?;
+    // (path, relative name, size, mtime, is_dir)
+    let mut level: Vec<(PathBuf, String, u64, i64, bool)> = Vec::new();
+    for dir_entry in read_dir {
+        let dir_entry = dir_entry
+            .map_err(|e| ArchiveError::Other(anyhow!("Could not read {}: {e}", dir.display())))?;
+        let name = dir_entry.file_name().to_string_lossy().into_owned();
+        if is_ignored(&name) {
+            continue;
+        }
+        let Some(md) = followed_metadata(root, &dir_entry) else {
+            continue;
+        };
+        if !md.is_dir() && !md.is_file() {
+            continue;
+        }
+        let rel = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        level.push((dir_entry.path(), rel, md.len(), mtime_ms(&md), md.is_dir()));
+    }
+    level.sort_by(|a, b| {
+        b.4.cmp(&a.4)
+            .then_with(|| b.3.cmp(&a.3))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    for (path, rel, size, _mtime, is_dir) in level {
+        if is_dir {
+            total += collect_archive_entries(root, &path, &rel, entries)?;
+        } else {
+            if entries.len() >= MAX_ENTRIES {
+                return Err(ArchiveError::TooMany);
+            }
+            total = match total.checked_add(size) {
+                Some(total) => total,
+                None => return Err(ArchiveError::TooLarge(u64::MAX)),
+            };
+            if total > MAX_ARCHIVE_BYTES {
+                return Err(ArchiveError::TooLarge(total));
+            }
+            entries.push((path, rel, size));
+        }
+    }
+    Ok(total)
 }
 
 /// Delete a file or folder in the artifacts dir.
@@ -717,16 +899,26 @@ mod tests {
     }
 
     #[test]
-    fn listing_gives_project_and_experiment_names_no_special_order() {
+    fn listing_puts_folders_first_then_newest_first() {
         let (root, base, _) = scratch();
-        for name in ["project", "baseline", "notes"] {
-            std::fs::create_dir(base.join(name)).unwrap();
-        }
+        let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let set_mtime = |path: &Path, t: std::time::SystemTime| {
+            let file = std::fs::File::open(path).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(t))
+                .unwrap();
+        };
+        std::fs::create_dir(base.join("oldest")).unwrap();
+        std::fs::create_dir(base.join("middle")).unwrap();
+        std::fs::create_dir(base.join("newest")).unwrap();
         std::fs::write(base.join("summary.md"), "# Summary").unwrap();
+        set_mtime(&base.join("oldest"), at(1_000));
+        set_mtime(&base.join("middle"), at(2_000));
+        set_mtime(&base.join("newest"), at(3_000));
+        set_mtime(&base.join("summary.md"), at(4_000));
         let canonical = crate::paths::canonicalize(&base).unwrap();
         let (entries, truncated) = collect_tree(&canonical, &canonical, "", &mut 0);
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, ["baseline", "notes", "project", "summary.md"]);
+        assert_eq!(names, ["newest", "middle", "oldest", "summary.md"]);
         assert!(!truncated);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -734,9 +926,18 @@ mod tests {
     #[test]
     fn report_md_is_an_ordinary_nested_file() {
         let (root, base, _) = scratch();
+        let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
         std::fs::create_dir(base.join("exp")).unwrap();
         std::fs::write(base.join("exp/analysis.md"), "# Analysis").unwrap();
         std::fs::write(base.join("exp/report.md"), "# Report").unwrap();
+        let analysis = std::fs::File::open(base.join("exp/analysis.md")).unwrap();
+        analysis
+            .set_times(std::fs::FileTimes::new().set_modified(at(2_000)))
+            .unwrap();
+        let report = std::fs::File::open(base.join("exp/report.md")).unwrap();
+        report
+            .set_times(std::fs::FileTimes::new().set_modified(at(1_000)))
+            .unwrap();
         let canonical = crate::paths::canonicalize(&base).unwrap();
         let (entries, _) = collect_tree(&canonical, &canonical, "", &mut 0);
         assert_eq!(entries.len(), 1);
@@ -747,6 +948,84 @@ mod tests {
             .map(|entry| entry.name.as_str())
             .collect();
         assert_eq!(names, ["analysis.md", "report.md"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_zips_a_folders_content_at_the_root_without_escaping_or_hidden_files() {
+        let (root, base, outside) = scratch();
+        std::fs::create_dir(base.join("exp")).unwrap();
+        std::fs::write(base.join("exp/report.md"), "# Report").unwrap();
+        std::fs::write(base.join("top.txt"), "top").unwrap();
+        std::fs::write(base.join(".hidden"), "no").unwrap();
+        std::fs::write(outside.join("secret.txt"), "leak").unwrap();
+        symlink(outside.join("secret.txt"), base.join("leak.txt")).unwrap();
+        let out = root.join("folder.zip");
+        archive_dir(&base, &out).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert_eq!(names, ["exp/report.md", "top.txt"]);
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut zip.by_name("exp/report.md").unwrap(), &mut body).unwrap();
+        assert_eq!(body, b"# Report");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_of_an_empty_folder_has_no_entries() {
+        let (root, base, _) = scratch();
+        let out = root.join("empty.zip");
+        archive_dir(&base, &out).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(zip::ZipArchive::new(std::io::Cursor::new(bytes))
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_rejects_folders_with_too_many_files() {
+        let (root, base, _) = scratch();
+        for i in 0..MAX_ENTRIES + 1 {
+            std::fs::write(base.join(format!("f{i:04}")), "x").unwrap();
+        }
+        let out = root.join("many.zip");
+        let error = archive_dir(&base, &out).unwrap_err();
+        assert!(matches!(error, ArchiveError::TooMany));
+        assert!(!out.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_rejects_folders_over_the_byte_cap() {
+        let (root, base, _) = scratch();
+        let big = base.join("big");
+        let file = std::fs::File::create(&big).unwrap();
+        // Sparse, so the cap test doesn't touch disk for the whole span.
+        file.set_len(MAX_ARCHIVE_BYTES + 1).unwrap();
+        let out = root.join("big.zip");
+        let error = archive_dir(&base, &out).unwrap_err();
+        assert!(
+            matches!(error, ArchiveError::TooLarge(size) if size > MAX_ARCHIVE_BYTES),
+            "got {error:?}"
+        );
+        assert!(!out.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_fails_for_files_and_missing_folders() {
+        let (root, base, _) = scratch();
+        let file = base.join("regular.txt");
+        std::fs::write(&file, "data").unwrap();
+        let out = root.join("x.zip");
+        let error = archive_dir(&file, &out).unwrap_err();
+        assert!(matches!(error, ArchiveError::Other(_)));
+        let missing = archive_dir(&base.join("absent"), &out).unwrap_err();
+        assert!(matches!(missing, ArchiveError::Other(_)));
         let _ = std::fs::remove_dir_all(root);
     }
 

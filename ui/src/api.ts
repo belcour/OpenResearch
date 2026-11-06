@@ -1755,6 +1755,10 @@ export function createApi(
       `/api/projects/${projectId}/files/file?path=${encodeURIComponent(path)}`,
     );
 
+  /** A folder's artifact contents as a `.zip` download. */
+  const artifactArchiveUrl = (projectId: string, path: string) =>
+    url(`/api/projects/${projectId}/files/archive?path=${encodeURIComponent(path)}`);
+
   /** Image parts store a server-minted file name; this is where it's served. */
   const chatAttachmentUrl = (name: string) =>
     url(`/api/chat/attachments/${encodeURIComponent(name)}`);
@@ -2745,6 +2749,7 @@ export function createApi(
     overleafUploadUrl,
     trackioRunUrl,
     artifactUrl,
+    artifactArchiveUrl,
     chatAttachmentUrl,
     listProjects,
     listProjectActivity,

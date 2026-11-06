@@ -42,6 +42,7 @@
   "file_tree_delete_confirm": "删除“{path}”？此操作无法撤销。",
   "file_tree_duplicate": "创建副本",
   "file_tree_file_actions": "{path} 的文件操作",
+  "file_tree_folder_actions": "{path} 的文件夹操作",
   "file_tree_open": "打开",
   "file_tree_rename_file": "重命名 {path}",
   "file_tree_clipboard_unavailable": "无法访问剪贴板。",

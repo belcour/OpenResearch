@@ -42,6 +42,7 @@
   "file_tree_delete_confirm": "「{path}」を削除しますか？この操作は取り消せません。",
   "file_tree_duplicate": "複製",
   "file_tree_file_actions": "{path} のファイル操作",
+  "file_tree_folder_actions": "{path} のフォルダー操作",
   "file_tree_open": "開く",
   "file_tree_rename_file": "{path} の名前を変更",
   "file_tree_clipboard_unavailable": "クリップボードにアクセスできません。",

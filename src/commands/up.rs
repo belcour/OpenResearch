@@ -775,6 +775,7 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>, reach: up_remote::Re
                 .delete(delete_artifact),
         )
         .route("/api/projects/{id}/files/file", get(serve_artifact))
+        .route("/api/projects/{id}/files/archive", get(archive_artifact))
         .route(
             "/api/projects/{id}/files/reveal",
             post(reveal_artifact_file),
@@ -4959,6 +4960,77 @@ async fn serve_artifact(
     )
     .await
     .map_err(ApiError::from)
+}
+
+/// A folder's artifact contents as a `.zip` download. The archive is built in
+/// a scratch dir and streamed from disk, as in the `.orx` export, so a large
+/// folder is never held in memory.
+async fn archive_artifact(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ArtifactPathQuery>,
+) -> std::result::Result<Response, ApiError> {
+    let admission = state
+        .project_lifecycle
+        .admit(&id)
+        .ok_or_else(|| bad_request("project deletion is in progress"))?;
+    let rel = q.path;
+    let scratch = local::git::TemporaryDirectory::new("orx-archive")
+        .map_err(|e| ApiError::from(anyhow!("Could not prepare the folder export: {e}")))?;
+    let out = scratch.path().join("export.zip");
+    let out_copy = out.clone();
+    let folder = tokio::task::spawn_blocking(move || -> std::result::Result<std::path::PathBuf, ApiError> {
+        // The lease covers the whole build: a project delete can't start under a running zip.
+        let _admission = admission;
+        let store = Store::open()?;
+        let project = store
+            .get_local_project(&id)?
+            .ok_or_else(|| not_found("project"))?;
+        let folder = local::files::file_path(&project, &rel).map_err(|_| not_found("file"))?;
+        if !folder.is_dir() {
+            return Err(bad_request(format!(
+                "\"{rel}\" is a file, not a folder — only folders download as a zip archive"
+            )));
+        }
+        local::files::archive_dir(&folder, &out_copy).map_err(|error| match error {
+            local::files::ArchiveError::TooMany => bad_request(
+                "that folder has too many files to download as one archive — download a subfolder instead",
+            ),
+            local::files::ArchiveError::TooLarge(size) => ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "that folder is {} before archiving, over the {limit} single-download limit — download a subfolder instead",
+                    local::files::human_size(size),
+                    limit = local::files::human_size(local::files::MAX_ARCHIVE_BYTES),
+                ),
+            ),
+            local::files::ArchiveError::Other(error) => ApiError::from(error),
+        })?;
+        Ok(folder)
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow!("archive task failed: {e}")))??;
+    let file = tokio::fs::File::open(&out)
+        .await
+        .map_err(|e| ApiError::from(anyhow!("Could not open the exported archive: {e}")))?;
+    // Streamed from disk, since a folder can outgrow memory; the stream keeps the scratch folder alive.
+    let body = futures::StreamExt::map(tokio_util::io::ReaderStream::new(file), move |chunk| {
+        let _keep = &scratch;
+        chunk
+    });
+    let name = folder
+        .file_name()
+        .map(|name| format!("{}.zip", name.to_string_lossy()))
+        .unwrap_or_else(|| "export.zip".to_string());
+    axum::response::Response::builder()
+        .header(header::CONTENT_TYPE, "application/zip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", urlencoding::encode(&name)),
+        )
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(axum::body::Body::from_stream(body))
+        .map_err(|error| ApiError::from(anyhow!("archive response failed: {error}")))
 }
 
 /// Keep update checks and telemetry delivery running for long-lived dashboards.

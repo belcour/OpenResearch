@@ -42,6 +42,7 @@
   "file_tree_delete_confirm": "Delete “{path}”? This cannot be undone.",
   "file_tree_duplicate": "Duplicate",
   "file_tree_file_actions": "File actions for {path}",
+  "file_tree_folder_actions": "Folder actions for {path}",
   "file_tree_open": "Open",
   "file_tree_rename_file": "Rename {path}",
   "file_tree_clipboard_unavailable": "Clipboard access is unavailable.",
