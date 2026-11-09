@@ -20,7 +20,7 @@ use crate::jobs::slurm;
 use crate::jobs::ssh;
 use crate::jobs::vercel;
 use crate::jobs::{is_terminal_stage, stage_to_run_status, BackendDescriptor};
-use crate::store::{log_path, now_ms, RunStatus, Store};
+use crate::store::{log_path, now_ms, Contact, RunStatus, Store, StoredRun};
 
 trait RunSink {
     fn finish(
@@ -50,6 +50,8 @@ trait RunSink {
     ) -> Result<bool>;
     fn set_result_markdown(&self, run: &str, result: &str) -> Result<()>;
     fn set_backend_json(&self, run: &str, descriptor: &str) -> Result<()>;
+    fn set_run_contact(&self, run: &str, contact: &Contact) -> Result<bool>;
+    fn run_contact(&self, run: &str) -> Result<Contact>;
     fn queue_finished_remote_cleanup(&self, run: &str) -> Result<()>;
 }
 
@@ -71,6 +73,12 @@ impl RunSink for Store {
     }
     fn set_backend_json(&self, run: &str, descriptor: &str) -> Result<()> {
         self.set_backend_json(run, descriptor)
+    }
+    fn set_run_contact(&self, run: &str, contact: &Contact) -> Result<bool> {
+        self.set_run_contact(run, contact)
+    }
+    fn run_contact(&self, run: &str) -> Result<Contact> {
+        self.run_contact(run)
     }
     fn queue_finished_remote_cleanup(&self, run: &str) -> Result<()> {
         self.queue_finished_remote_cleanup(run)
@@ -98,6 +106,12 @@ impl RunSink for std::sync::Mutex<Store> {
     fn set_backend_json(&self, run: &str, descriptor: &str) -> Result<()> {
         self.lock().unwrap().set_backend_json(run, descriptor)
     }
+    fn set_run_contact(&self, run: &str, contact: &Contact) -> Result<bool> {
+        self.lock().unwrap().set_run_contact(run, contact)
+    }
+    fn run_contact(&self, run: &str) -> Result<Contact> {
+        self.lock().unwrap().run_contact(run)
+    }
     fn queue_finished_remote_cleanup(&self, run: &str) -> Result<()> {
         self.lock().unwrap().queue_finished_remote_cleanup(run)
     }
@@ -114,6 +128,169 @@ const LOG_RETRY: Duration = Duration::from_secs(2);
 
 fn should_report_monitoring_error(already_reported: bool, elapsed: Option<Duration>) -> bool {
     already_reported || elapsed.is_some_and(|elapsed| elapsed >= paced(MONITORING_GRACE))
+}
+
+/// How long liveness may go unconfirmed before the run's row says unreachable.
+/// A healthy job can be silent for hours, so this clocks failed checks, not
+/// quiet logs.
+const UNREACHABLE_AFTER: Duration = Duration::from_secs(120);
+
+/// The run's contact owed to liveness: the row stays live until confirmations
+/// go silent past [`UNREACHABLE_AFTER`], then holds unreachable with the last
+/// confirmed moment and a cause that follows the latest error.
+struct Liveness {
+    /// When liveness was last confirmed. Seeded from an already-unreachable
+    /// stored contact, so a restarted supervisor keeps the original outage.
+    confirmed_at: Option<i64>,
+    /// What the row is believed to report.
+    reported: Option<Contact>,
+    after: Duration,
+}
+
+impl Liveness {
+    fn fresh(after: Duration, stored: Contact) -> Self {
+        let reported = matches!(stored, Contact::Unreachable { .. }).then(|| stored);
+        let confirmed_at = reported.as_ref().and_then(contact_since);
+        Self {
+            confirmed_at,
+            reported,
+            after,
+        }
+    }
+
+    /// Liveness is confirmed. When the outage the row reported just ended, to
+    /// clear it.
+    fn confirmed(&mut self, now: i64) -> Option<i64> {
+        self.confirmed_at = Some(now);
+        self.reported
+            .take()
+            .and_then(|contact| contact_since(&contact))
+    }
+
+    /// A liveness check failed with `cause`. What the row must now report,
+    /// when that differs from what it reports already.
+    fn failing(&mut self, now: i64, cause: &str) -> Option<Contact> {
+        let since = match self.confirmed_at {
+            Some(since) => since,
+            None => {
+                self.confirmed_at = Some(now);
+                now
+            }
+        };
+        let cause = cause.to_string();
+        let next = Contact::Unreachable {
+            since,
+            cause: cause.clone(),
+        };
+        match &self.reported {
+            Some(current) if *current == next => None,
+            Some(Contact::Unreachable { since: start, .. }) => {
+                // A continuing outage keeps its start; the cause follows the last report.
+                let next = Contact::Unreachable {
+                    since: *start,
+                    cause,
+                };
+                self.reported = Some(next.clone());
+                Some(next)
+            }
+            _ if now.saturating_sub(since) < self.after.as_millis() as i64 => None,
+            _ => {
+                self.reported = Some(next.clone());
+                Some(next)
+            }
+        }
+    }
+}
+
+fn contact_since(contact: &Contact) -> Option<i64> {
+    match contact {
+        Contact::Unreachable { since, .. } | Contact::NeedsAuth { since, .. } => Some(*since),
+        _ => None,
+    }
+}
+
+/// Record a contact transition the supervisor learned, leaving an abandoned
+/// run's tombstone untouched.
+fn apply_contact(sink: &dyn RunSink, run_id: &str, contact: Option<&Contact>) {
+    let Some(contact) = contact else { return };
+    if matches!(
+        sink.run_contact(run_id).ok(),
+        Some(Contact::Unreconciled { .. })
+    ) {
+        return;
+    }
+    if let Err(err) = sink.set_run_contact(run_id, contact) {
+        eprintln!("supervise {run_id}: could not record run contact: {err}");
+    }
+}
+
+/// Liveness is confirmed again: clear an outstanding unreachable report.
+fn on_liveness(store: &dyn RunSink, run_id: &str, liveness: &mut Liveness) {
+    if liveness.confirmed(now_ms()).is_some() {
+        apply_contact(store, run_id, Some(&Contact::Live));
+    }
+}
+
+/// A liveness check failed: report unreachable once the outage outgrows the
+/// grace window, refreshing the cause only between reports.
+fn on_liveness_failure(store: &dyn RunSink, run_id: &str, liveness: &mut Liveness, cause: &str) {
+    if let Some(contact) = liveness.failing(now_ms(), cause) {
+        apply_contact(store, run_id, Some(&contact));
+    }
+}
+
+/// What the user is owed: the row's stored contact, unless a legacy run that
+/// is not terminal has been left without a supervisor for the adopter's settle
+/// window — nobody is then keeping the row honest.
+pub(crate) fn effective_contact(store: &Store, run: &StoredRun, now: i64) -> Result<Contact> {
+    if crate::engine::is_engine_row(run) {
+        return store.run_contact(&run.id);
+    }
+    let stored = store.run_contact(&run.id)?;
+    let orphaned = matches!(stored, Contact::Live)
+        && !RunStatus::parse(&run.status).is_some_and(RunStatus::is_terminal)
+        && !supervisor_running(&run.id)
+        && now.saturating_sub(run.updated_at) > crate::engine::ORPHANED_RUN_SETTLE_MS;
+    Ok(if orphaned {
+        Contact::Unreachable {
+            since: run.updated_at,
+            cause: "no supervisor is watching the run".into(),
+        }
+    } else {
+        stored
+    })
+}
+
+/// A tombstone worth keeping watched: an abandoned run whose cancel is not
+/// confirmed, on a backend whose run dir proves the stop without relaunching.
+pub(crate) fn keeps_watching(stored: &StoredRun, kind: &str) -> bool {
+    RunStatus::parse(&stored.status) == Some(RunStatus::Lost)
+        && stored.cancel_requested
+        && matches!(kind, "local_job" | "tinker_job" | "slurm_job" | "ssh_job")
+}
+
+/// Added to the result when the run dir's terminal state is first seen across
+/// an unreachable window: the host says how it ended, the ending went unseen.
+fn unwitnessed_finish_note(
+    host: &str,
+    dir: &str,
+    run_id: &str,
+    last_seen: i64,
+    status: RunStatus,
+) -> String {
+    let outcome = match status {
+        RunStatus::Done => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "ended as cancelled",
+        _ => "ended",
+    };
+    format!(
+        "orx could not observe this run from {} on, so it did not witness its final \
+         transition; the host now reports it {outcome}. The full log and any result files \
+         the job wrote (such as `eval.json`) are still in `{dir}` on {host}; \
+         `orx logs {run_id}` shows what orx collected before contact was lost.",
+        crate::telemetry::iso8601_utc(last_seen)
+    )
 }
 
 fn open_supervisor_lock(path: &std::path::Path) -> Result<fd_lock::RwLock<std::fs::File>> {
@@ -213,9 +390,6 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
     let stored = store
         .get_run(&run_id)?
         .ok_or_else(|| anyhow!("Run {} not found in the local store.", run_id))?;
-    if status_of(&stored)?.is_terminal() {
-        return Ok(());
-    }
     if store.get_local_experiment(&stored.experiment_id)?.is_none() {
         return Err(anyhow!(
             "Run {run_id} does not belong to a local orx experiment."
@@ -239,6 +413,13 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
                 ),
             )?;
         }
+        return Ok(());
+    }
+    // An abandoned run stays watched until the host confirms the stop: the
+    // cancel stays alive for if the job is still there. update_status cannot
+    // move a terminal row, so a late supervisor on such a row only confirms
+    // and cleans up.
+    if status_of(&stored)?.is_terminal() && !keeps_watching(&stored, &descriptor.kind) {
         return Ok(());
     }
     if descriptor.kind == "k8s_job" {
@@ -291,13 +472,21 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
 
     let mut last_status = status_of(&stored)?;
     let mut cancel_sent = false;
+    let mut liveness = Liveness::fresh(
+        UNREACHABLE_AFTER,
+        store.run_contact(&run_id).unwrap_or(Contact::Live),
+    );
 
     loop {
         // Where is the job now?
         let job = match hf::inspect_job(&token, &namespace, &job_id).await {
-            Ok(j) => j,
+            Ok(j) => {
+                on_liveness(&store, &run_id, &mut liveness);
+                j
+            }
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                on_liveness_failure(&store, &run_id, &mut liveness, &err.to_string());
                 tokio::time::sleep(paced(POLL_INTERVAL)).await;
                 continue;
             }
@@ -489,12 +678,20 @@ async fn run_k8s(
 
     let mut last_status = status_of(&stored)?;
     let mut cancel_sent = false;
+    let mut liveness = Liveness::fresh(
+        UNREACHABLE_AFTER,
+        store.run_contact(&run_id).unwrap_or(Contact::Live),
+    );
 
     loop {
         let job = match k8s::inspect_job(context.as_deref(), &namespace, &job_name).await {
-            Ok(j) => j,
+            Ok(j) => {
+                on_liveness(&store, &run_id, &mut liveness);
+                j
+            }
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                on_liveness_failure(&store, &run_id, &mut liveness, &err.to_string());
                 tokio::time::sleep(paced(POLL_INTERVAL)).await;
                 continue;
             }
@@ -642,12 +839,20 @@ async fn run_modal(
 
     let mut last_status = status_of(&stored)?;
     let mut cancel_sent = false;
+    let mut liveness = Liveness::fresh(
+        UNREACHABLE_AFTER,
+        store.run_contact(&run_id).unwrap_or(Contact::Live),
+    );
 
     loop {
         let job = match modal::inspect_job(&sandbox_id).await {
-            Ok(j) => j,
+            Ok(j) => {
+                on_liveness(&store, &run_id, &mut liveness);
+                j
+            }
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                on_liveness_failure(&store, &run_id, &mut liveness, &err.to_string());
                 tokio::time::sleep(paced(POLL_INTERVAL)).await;
                 continue;
             }
@@ -772,12 +977,20 @@ async fn run_vercel(
 
     let mut last_status = status_of(&stored)?;
     let mut cancel_sent = false;
+    let mut liveness = Liveness::fresh(
+        UNREACHABLE_AFTER,
+        store.run_contact(&run_id).unwrap_or(Contact::Live),
+    );
 
     loop {
         let job = match vercel::inspect_job(&name, &process_id).await {
-            Ok(j) => j,
+            Ok(j) => {
+                on_liveness(&store, &run_id, &mut liveness);
+                j
+            }
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                on_liveness_failure(&store, &run_id, &mut liveness, &err.to_string());
                 tokio::time::sleep(paced(POLL_INTERVAL)).await;
                 continue;
             }
@@ -998,6 +1211,10 @@ async fn watch_ssh_job(
     let mut failing_since = None;
     let mut last_error = None;
     let mut missing_polls = 0;
+    let mut liveness = Liveness::fresh(
+        UNREACHABLE_AFTER,
+        store.run_contact(run_id).unwrap_or(Contact::Live),
+    );
 
     loop {
         if !cancel_sent && local_cancel_requested(store, run_id) {
@@ -1058,19 +1275,35 @@ async fn watch_ssh_job(
                 Err(err) => eprintln!("supervise {run_id}: could not save monitoring state: {err}"),
             }
         }
+        // When the first liveness confirmation lands after an unreachable
+        // window, the terminal verdict it carries went unseen: remember when
+        // contact was last known so the finish can say so.
+        let mut unwitnessed: Option<i64> = None;
         let job = match observed {
-            Ok(job) => job,
-            Err(_) => match sandbox {
-                Some((creds, id)) if openresearch::box_deleted(creds, id).await => ssh::JobState {
-                    stage: if descriptor.rental_lease.is_some() {
-                        "LOST"
-                    } else {
-                        "ERROR"
+            Ok(job) => {
+                if let Some(seen) = liveness.confirmed(now_ms()) {
+                    unwitnessed = Some(seen);
+                    apply_contact(store, run_id, Some(&Contact::Live));
+                }
+                job
+            }
+            Err(err) => match sandbox {
+                Some((creds, id)) if openresearch::box_deleted(creds, id).await => {
+                    // The platform answered, not the box: the run dir is gone
+                    // with it, so there is no host proof to show.
+                    liveness.confirmed(now_ms());
+                    ssh::JobState {
+                        stage: if descriptor.rental_lease.is_some() {
+                            "LOST"
+                        } else {
+                            "ERROR"
+                        }
+                        .into(),
+                        message: Some(format!("box {id} was deleted while the run was active")),
                     }
-                    .into(),
-                    message: Some(format!("box {id} was deleted while the run was active")),
-                },
+                }
                 _ => {
+                    on_liveness_failure(store, run_id, &mut liveness, &err.to_string());
                     missing_polls = 0;
                     tokio::time::sleep(paced(POLL_INTERVAL)).await;
                     continue;
@@ -1122,6 +1355,12 @@ async fn watch_ssh_job(
             if !collected {
                 log_task.abort();
             }
+            // The host is speaking again, but the terminal state arrived
+            // across the outage — the run dir can no longer back up anything
+            // orx did not collect itself.
+            let note = unwitnessed
+                .filter(|_| job.message.as_deref() != Some(ssh::RUN_DIR_MISSING))
+                .map(|seen| unwitnessed_finish_note(&target.dest, &dir, run_id, seen, status));
             let reason = job
                 .message
                 .as_ref()
@@ -1133,7 +1372,13 @@ async fn watch_ssh_job(
                         "Job failed"
                     };
                     format!("{prefix}: {message}")
-                });
+                })
+                .map(|message| {
+                    note.as_ref()
+                        .map(|note| format!("{message}\n\n{note}"))
+                        .unwrap_or(message)
+                })
+                .or(note.clone());
             store.finish(run_id, status, exit_code, reason.as_deref())?;
             if descriptor.rental_lease.is_some()
                 && stage != "LOST"
@@ -1697,6 +1942,10 @@ async fn run_slurm(
     let mut cancel_sent = descriptor.cancellation_accepted;
     let mut failing_since = None;
     let mut last_error = None;
+    let mut liveness = Liveness::fresh(
+        UNREACHABLE_AFTER,
+        store.run_contact(&run_id).unwrap_or(Contact::Live),
+    );
 
     loop {
         if !cancel_sent && local_cancel_requested(&store, &run_id) {
@@ -1745,11 +1994,17 @@ async fn run_slurm(
                 Err(err) => eprintln!("supervise {run_id}: could not save monitoring state: {err}"),
             }
         }
-        if status_error.is_some() {
+        if let Some(error) = &status_error {
+            on_liveness_failure(&store, &run_id, &mut liveness, error);
             tokio::time::sleep(paced(POLL_INTERVAL)).await;
             continue;
         }
         let job = observed?;
+        // The scheduler spoke across the outage: the verdict went unseen.
+        let unwitnessed = liveness.confirmed(now_ms());
+        if unwitnessed.is_some() {
+            apply_contact(&store, &run_id, Some(&Contact::Live));
+        }
         let stage = job.stage.as_str();
         let status = run_status_for_stage(&store, &run_id, cancel_sent, stage);
 
@@ -1762,16 +2017,20 @@ async fn run_slurm(
             if !collected {
                 log_task.abort();
             }
-            let applied = store.update_status(&run_id, status, Some(now_ms()), None)?;
-            if applied && status == RunStatus::Failed {
-                if let Some(msg) = &job.message {
-                    if let Err(err) =
-                        store.set_result_markdown(&run_id, &format!("Job failed: {msg}"))
-                    {
-                        eprintln!("supervise {run_id}: could not record failure reason: {err}");
-                    }
-                }
-            }
+            let note =
+                unwitnessed.map(|seen| unwitnessed_finish_note(&host, &dir, &run_id, seen, status));
+            let reason = job
+                .message
+                .as_ref()
+                .filter(|_| status == RunStatus::Failed)
+                .map(|message| format!("Job failed: {message}"))
+                .map(|message| {
+                    note.as_ref()
+                        .map(|note| format!("{message}\n\n{note}"))
+                        .unwrap_or(message)
+                })
+                .or(note.clone());
+            store.finish(&run_id, status, None, reason.as_deref())?;
             if collected {
                 queue_remote_cleanup(&store, &run_id);
             }
@@ -1832,6 +2091,10 @@ async fn run_ray(
 
     let mut last_status = status_of(&stored)?;
     let mut cancel_sent = false;
+    let mut liveness = Liveness::fresh(
+        UNREACHABLE_AFTER,
+        store.run_contact(&run_id).unwrap_or(Contact::Live),
+    );
     // "GONE" (a 404 — the cluster no longer knows the job) must persist for a
     // full minute before it's believed: it also fires while a Ray head
     // restarts. Any other observation resets the count.
@@ -1840,9 +2103,13 @@ async fn run_ray(
 
     loop {
         let mut job = match ray::inspect_job(&address, &submission_id).await {
-            Ok(j) => j,
+            Ok(j) => {
+                on_liveness(&store, &run_id, &mut liveness);
+                j
+            }
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
+                on_liveness_failure(&store, &run_id, &mut liveness, &err.to_string());
                 tokio::time::sleep(paced(POLL_INTERVAL)).await;
                 continue;
             }
@@ -2181,6 +2448,283 @@ mod tests {
         drop(guard);
         assert!(!lock_held(&path));
         drop(supervisor);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn witnessed_row(id: &str, status: &str, cancel_requested: bool) -> StoredRun {
+        StoredRun {
+            id: id.into(),
+            experiment_id: "experiment-1".into(),
+            project_id: "project-1".into(),
+            status: status.into(),
+            backend_json: "{}".into(),
+            command: String::new(),
+            created_at: 1,
+            updated_at: 1,
+            ended_at: None,
+            exit_code: None,
+            commit_sha: None,
+            result_markdown: None,
+            cancel_requested,
+            cancel_reason: None,
+            chat_session_id: None,
+        }
+    }
+
+    #[test]
+    fn liveness_clocks_from_the_first_failure_and_stays_silent_inside_the_window() {
+        let mut liveness = Liveness::fresh(UNREACHABLE_AFTER, Contact::Live);
+        assert_eq!(liveness.failing(0, "offline"), None);
+        assert_eq!(liveness.failing(119_999, "offline"), None);
+        assert_eq!(
+            liveness.failing(120_000, "offline"),
+            Some(Contact::Unreachable {
+                since: 0,
+                cause: "offline".into()
+            })
+        );
+    }
+
+    #[test]
+    fn liveness_reports_from_the_last_confirmation_and_recovery_closes_the_outage() {
+        let mut liveness = Liveness::fresh(UNREACHABLE_AFTER, Contact::Live);
+        assert_eq!(liveness.confirmed(5_000), None);
+        assert_eq!(liveness.failing(124_999, "offline"), None);
+        assert_eq!(
+            liveness.failing(125_000, "offline"),
+            Some(Contact::Unreachable {
+                since: 5_000,
+                cause: "offline".into()
+            })
+        );
+        // One confirmation ends the outage and says when contact was last good.
+        assert_eq!(liveness.confirmed(200_000), Some(5_000));
+        assert_eq!(liveness.confirmed(210_000), None);
+    }
+
+    #[test]
+    fn a_continuing_outage_keeps_its_since_and_only_refreshes_the_cause() {
+        let mut liveness = Liveness::fresh(UNREACHABLE_AFTER, Contact::Live);
+        liveness.failing(0, "offline");
+        assert_eq!(
+            liveness.failing(120_000, "offline"),
+            Some(Contact::Unreachable {
+                since: 0,
+                cause: "offline".into()
+            })
+        );
+        assert_eq!(
+            liveness.failing(150_000, "host power cycled"),
+            Some(Contact::Unreachable {
+                since: 0,
+                cause: "host power cycled".into()
+            })
+        );
+        // The same report does not write again.
+        assert_eq!(liveness.failing(160_000, "host power cycled"), None);
+    }
+
+    #[test]
+    fn a_restarted_supervisor_inherits_the_stored_outage() {
+        let stored = Contact::Unreachable {
+            since: 9_000,
+            cause: "offline".into(),
+        };
+        let mut liveness = Liveness::fresh(UNREACHABLE_AFTER, stored);
+        // Still down: the original outage is untouched unless the cause moves.
+        assert_eq!(liveness.failing(900_000, "offline"), None);
+        assert_eq!(
+            liveness.failing(901_000, "still backoff"),
+            Some(Contact::Unreachable {
+                since: 9_000,
+                cause: "still backoff".into()
+            })
+        );
+        assert_eq!(liveness.confirmed(910_000), Some(9_000));
+    }
+
+    #[test]
+    fn keeps_watching_only_abandoned_runs_its_backends_can_prove_gone() {
+        let row = witnessed_row("run-1", "lost", true);
+        assert!(keeps_watching(&row, "ssh_job"));
+        assert!(keeps_watching(&row, "local_job"));
+        assert!(keeps_watching(&row, "tinker_job"));
+        assert!(keeps_watching(&row, "slurm_job"));
+        // The provisioned box can be relaunched, and provider APIs have their
+        // own gone semantics: neither gets a second lifecycle here.
+        assert!(!keeps_watching(&row, "openresearch_job"));
+        assert!(!keeps_watching(&row, "hf_job"));
+        assert!(!keeps_watching(&row, "ray_job"));
+
+        let unrequested = witnessed_row("run-1", "lost", false);
+        assert!(!keeps_watching(&unrequested, "ssh_job"));
+        let still_running = witnessed_row("run-1", "running", true);
+        assert!(!keeps_watching(&still_running, "ssh_job"));
+    }
+
+    #[test]
+    fn the_unwitnessed_finish_note_owes_the_host_dir_and_the_local_log() {
+        let seen = 1_761_000_000_000i64;
+        let note = unwitnessed_finish_note(
+            "lab.example",
+            "/data/runs/run-1",
+            "run-1",
+            seen,
+            RunStatus::Done,
+        );
+        assert!(
+            note.contains(&crate::telemetry::iso8601_utc(seen)),
+            "{note}"
+        );
+        assert!(note.contains("lab.example"), "{note}");
+        assert!(note.contains("`/data/runs/run-1` on lab.example"), "{note}");
+        assert!(note.contains("completed"), "{note}");
+        // The local pointer is the run id, not the remote path.
+        assert!(note.contains("orx logs run-1"), "{note}");
+        assert!(!note.contains("orx logs /data/runs/run-1"), "{note}");
+    }
+
+    #[test]
+    fn effective_contact_demotes_only_legacy_runs_left_without_a_supervisor() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-effective-contact-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let run = witnessed_row("run-1", "running", false);
+        store.upsert_run(&run).unwrap();
+        let now = now_ms();
+
+        // Old, and nothing is watching: the row must say so.
+        assert_eq!(
+            effective_contact(&store, &run, now).unwrap(),
+            Contact::Unreachable {
+                since: run.updated_at,
+                cause: "no supervisor is watching the run".into()
+            }
+        );
+        // A last write inside the settle window still trusts the live contact.
+        store
+            .update_status("run-1", RunStatus::Running, None, None)
+            .unwrap();
+        let fresh = store.get_run("run-1").unwrap().unwrap();
+        assert_eq!(
+            effective_contact(&store, &fresh, fresh.updated_at + 1).unwrap(),
+            Contact::Live
+        );
+        // A stored report stands as written, demotion or not.
+        let outage = Contact::Unreachable {
+            since: 7,
+            cause: "offline".into(),
+        };
+        assert!(store.set_run_contact("run-1", &outage).unwrap());
+        let run = store.get_run("run-1").unwrap().unwrap();
+        assert_eq!(
+            effective_contact(
+                &store,
+                &run,
+                run.updated_at + crate::engine::ORPHANED_RUN_SETTLE_MS + 1
+            )
+            .unwrap(),
+            outage
+        );
+
+        // Engine rows always show what their engine stored.
+        let engine = StoredRun {
+            id: "engine-1".into(),
+            backend_json: r#"{"kind":"engine","jobId":"/runs/engine-1"}"#.into(),
+            ..witnessed_row("engine-1", "running", false)
+        };
+        store.upsert_run(&engine).unwrap();
+        assert_eq!(
+            effective_contact(&store, &engine, now).unwrap(),
+            Contact::Live
+        );
+        let needs_auth = Contact::NeedsAuth {
+            since: 8,
+            cause: "Fresh key".into(),
+        };
+        assert!(store.set_run_contact("engine-1", &needs_auth).unwrap());
+        let engine = store.get_run("engine-1").unwrap().unwrap();
+        assert_eq!(effective_contact(&store, &engine, now).unwrap(), needs_auth);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_legacy_run_keeps_its_contact_while_a_supervisor_runs_for_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "orx-effective-contact-held-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open_at(dir.clone()).unwrap();
+        // A distinct id: supervisor locks live in the shared test data dir.
+        let id = uuid::Uuid::new_v4().to_string();
+        let run = witnessed_row(&id, "running", false);
+        store.upsert_run(&run).unwrap();
+
+        let lock_path = supervisor_lock_path(&id);
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut supervisor = open_supervisor_lock(&lock_path).unwrap();
+        let guard = supervisor.try_write().unwrap();
+        let stored = store.get_run(&id).unwrap().unwrap();
+        let owed = effective_contact(
+            &store,
+            &stored,
+            stored.updated_at + crate::engine::ORPHANED_RUN_SETTLE_MS + 1,
+        )
+        .unwrap();
+        assert_eq!(owed, Contact::Live);
+
+        drop(guard);
+        drop(supervisor);
+        let owed = effective_contact(
+            &store,
+            &stored,
+            stored.updated_at + crate::engine::ORPHANED_RUN_SETTLE_MS + 1,
+        )
+        .unwrap();
+        assert!(
+            matches!(owed, Contact::Unreachable { .. }),
+            "expected {owed:?}"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_contact_leaves_an_abandoned_run_unreconciled() {
+        let dir = std::env::temp_dir().join(format!("orx-apply-contact-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .upsert_run(&witnessed_row("run-1", "lost", true))
+            .unwrap();
+        assert!(store
+            .set_run_contact(
+                "run-1",
+                &Contact::Unreconciled {
+                    since: 1,
+                    detail: "Abandoned.".into()
+                }
+            )
+            .unwrap());
+        apply_contact(&store, "run-1", Some(&Contact::Live));
+        apply_contact(
+            &store,
+            "run-1",
+            Some(&Contact::Unreachable {
+                since: 2,
+                cause: "offline".into(),
+            }),
+        );
+        assert!(matches!(
+            store.run_contact("run-1").unwrap(),
+            Contact::Unreconciled { .. }
+        ));
+
+        drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -126,7 +126,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
         // Under the engine lock, before any notice can be produced.
         store.migrate_run_wakeups()?;
         if !crate::config::run_engine_settings()?.0 {
-            for run in store.list_active_runs()? {
+            for run in store.list_supervised_runs()? {
                 if !crate::engine::is_engine_row(&run)
                     && store.get_local_experiment(&run.experiment_id)?.is_some()
                 {
@@ -1211,6 +1211,9 @@ impl ApiRun {
             .is_some_and(|state| state.cancel_accepted_at.is_some());
         let launch = state.as_ref().and_then(|state| state.launch.as_ref());
         let collection = store.log_collection(&run.id)?;
+        // A legacy row owes its contact to who is watching it, not to the
+        // column alone.
+        let contact = crate::commands::supervise::effective_contact(store, run, now_ms())?;
         Ok(Self {
             id: run.id.clone(),
             experiment_id: run.experiment_id.clone(),
@@ -1228,9 +1231,7 @@ impl ApiRun {
             cancel_unconfirmed: state
                 .as_ref()
                 .and_then(|state| state.cancel_unconfirmed.clone()),
-            contact: state
-                .map(|state| state.contact)
-                .filter(|contact| *contact != crate::store::Contact::Live),
+            contact: (contact != crate::store::Contact::Live).then_some(contact),
             cancelling: !is_terminal(&run.status) && (run.cancel_requested || accepted),
             lost_reason: run
                 .result_markdown
@@ -5108,8 +5109,9 @@ fn adopt_orphaned_runs_once() -> Result<Vec<(String, crate::error::Error)>> {
         return Ok(failures);
     }
     let store = Store::open()?;
-    for run in store.list_active_runs()? {
-        // Without a job handle the launch may still be submitting, and a supervisor would fail it.
+    for run in store.list_supervised_runs()? {
+        // Without a job handle the launch may still be submitting, and a supervisor would fail it. An
+        // abandoned run has one: its cancel may still be delivered, so it counts as supervised.
         let submitted = crate::jobs::BackendDescriptor::parse(&run.backend_json)
             .is_ok_and(|descriptor| descriptor.job_id.is_some());
         if crate::engine::is_engine_row(&run)
@@ -10781,7 +10783,7 @@ mod tests {
             backend_json: backend.to_json(),
             command: String::new(),
             created_at: 1,
-            updated_at: 2,
+            updated_at: now_ms(),
             ended_at: None,
             exit_code: None,
             commit_sha: None,

@@ -1821,6 +1821,17 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Runs a `orx supervise` should still be watching: in flight, or an
+    /// abandoned run whose cancel may yet be delivered.
+    pub fn list_supervised_runs(&self) -> Result<Vec<StoredRun>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT_RUN} WHERE status IN ('starting', 'running')
+               OR (status = 'lost' AND cancel_requested = 1) ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt.query_map([], row_to_run)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn list_runs_by_project(&self, project_id: &str) -> Result<Vec<StoredRun>> {
         let mut stmt = self.conn.prepare(&format!(
             "{SELECT_RUN} WHERE project_id = ?1 ORDER BY created_at DESC"
@@ -5425,6 +5436,21 @@ impl Store {
         )? == 1)
     }
 
+    /// The stored contact; [`Contact::Live`] when no fact is recorded.
+    pub fn run_contact(&self, run_id: &str) -> Result<Contact> {
+        let json: Option<String> = self
+            .conn
+            .query_row("SELECT contact FROM runs WHERE id = ?1", [run_id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .unwrap_or(None);
+        Ok(json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?
+            .unwrap_or(Contact::Live))
+    }
+
     pub fn set_submission_fence(
         &self,
         run_id: &str,
@@ -5595,6 +5621,32 @@ impl Store {
             params![run_id, now_ms(), reason],
             |row| row.get(0),
         ).optional()?)
+    }
+
+    /// Abandon a 0.2.x run: takes the cancel, declares the run lost, and leaves
+    /// the [`Contact::Unreconciled`] tombstone that an engine abandon does. Its
+    /// supervisor keeps delivering the stop when the job is reachable again.
+    pub fn abandon_legacy_run(&self, run_id: &str) -> Result<bool> {
+        use crate::engine::reconcile::ABANDONED;
+        let Some(since) = self.accept_run_cancel(run_id, Some("Abandoned."))? else {
+            return Ok(false);
+        };
+        // The 0.2.x supervisor polls `cancel_requested`; the accepted cancel is
+        // not enough for it to act.
+        let _ = self.request_cancel(run_id, "Abandoned.")?;
+        let now = now_ms();
+        if !self.update_status(run_id, RunStatus::Lost, Some(now), None)? {
+            return Ok(false);
+        }
+        self.set_result_markdown(run_id, ABANDONED)?;
+        self.set_run_contact(
+            run_id,
+            &Contact::Unreconciled {
+                since,
+                detail: ABANDONED.into(),
+            },
+        )?;
+        Ok(true)
     }
 
     pub fn subscribe_run(
@@ -11515,5 +11567,128 @@ mod tests {
             log_path(Path::new("/isolated/data"), "../run_A-1/../../x"),
             Path::new("/isolated/data/run-logs/run_A-1x.log")
         );
+    }
+
+    #[test]
+    fn run_contact_defaults_to_live_and_round_trips_the_recorded_facts() {
+        let dir = std::env::temp_dir().join(format!("orx-run-contact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .upsert_run(&run_fixture("watched", "running", None))
+            .unwrap();
+        assert_eq!(store.run_contact("watched").unwrap(), Contact::Live);
+        assert_eq!(store.run_contact("absent").unwrap(), Contact::Live);
+        let unreachable = Contact::Unreachable {
+            since: 5,
+            cause: "host unreachable".into(),
+        };
+        assert!(store.set_run_contact("watched", &unreachable).unwrap());
+        assert_eq!(store.run_contact("watched").unwrap(), unreachable);
+        assert!(store.set_run_contact("watched", &Contact::Live).unwrap());
+        assert_eq!(store.run_contact("watched").unwrap(), Contact::Live);
+        assert!(store
+            .conn
+            .query_row(
+                "SELECT contact IS NULL FROM runs WHERE id = ?1",
+                ["watched"],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn supervised_runs_are_the_inflight_and_the_abandoned_without_others() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-supervised-runs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_at(dir.clone()).unwrap();
+        for (id, status, cancel) in [
+            ("in_flight", "running", false),
+            ("starting_up", "starting", false),
+            ("abandoned", "lost", true),
+            ("lost_untended", "lost", false),
+            ("cancelled_done", "done", true),
+            ("done", "done", false),
+        ] {
+            let mut run = run_fixture(id, status, None);
+            run.cancel_requested = cancel;
+            store.upsert_run(&run).unwrap();
+        }
+        let runs = store.list_supervised_runs().unwrap();
+        let mut ids: Vec<&str> = runs.iter().map(|run| run.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["abandoned", "in_flight", "starting_up"]);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn abandon_legacy_run_takes_the_cancel_and_tombstones_the_row() {
+        use crate::engine::reconcile::ABANDONED;
+        let dir = std::env::temp_dir().join(format!("orx-abandon-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_at(dir.clone()).unwrap();
+        let mut run = run_fixture("legacy", "running", None);
+        run.backend_json = r#"{"kind":"ssh_job"}"#.into();
+        store.upsert_run(&run).unwrap();
+        assert!(store.abandon_legacy_run("legacy").unwrap());
+        let accepted_at: i64 = store
+            .conn
+            .query_row(
+                "SELECT cancel_accepted_at FROM runs WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let abandoned = store.get_run("legacy").unwrap().unwrap();
+        assert_eq!(abandoned.status, "lost");
+        assert!(abandoned.cancel_requested);
+        assert_eq!(abandoned.cancel_reason.as_deref(), Some("Abandoned."));
+        assert_eq!(abandoned.result_markdown.as_deref(), Some(ABANDONED));
+        assert_eq!(
+            store.run_contact("legacy").unwrap(),
+            Contact::Unreconciled {
+                since: accepted_at,
+                detail: ABANDONED.into(),
+            }
+        );
+        // The tombstone is final: a second abandon and a late supervisor's
+        // finish both leave it untouched.
+        assert!(!store.abandon_legacy_run("legacy").unwrap());
+        assert!(!store
+            .update_status("legacy", RunStatus::Done, Some(1000), Some(0))
+            .unwrap());
+        let frozen = store.get_run("legacy").unwrap().unwrap();
+        assert_eq!(frozen.status, "lost");
+        assert!(frozen.cancel_requested);
+        assert_eq!(frozen.result_markdown.as_deref(), Some(ABANDONED));
+        assert_eq!(
+            store.run_contact("legacy").unwrap(),
+            Contact::Unreconciled {
+                since: accepted_at,
+                detail: ABANDONED.into(),
+            }
+        );
+        // An already-requested cancel keeps its own intent; the abandon still
+        // takes over the outcome.
+        let mut run = run_fixture("requested", "running", None);
+        run.backend_json = r#"{"kind":"ssh_job"}"#.into();
+        store.upsert_run(&run).unwrap();
+        assert!(store.request_cancel("requested", "user asked").unwrap());
+        assert!(store.abandon_legacy_run("requested").unwrap());
+        let requested = store.get_run("requested").unwrap().unwrap();
+        assert_eq!(requested.status, "lost");
+        assert!(requested.cancel_requested);
+        assert_eq!(requested.cancel_reason.as_deref(), Some("user asked"));
+        assert_eq!(requested.result_markdown.as_deref(), Some(ABANDONED));
+        // Terminal rows have nothing left to abandon.
+        let run = run_fixture("ended", "done", None);
+        store.upsert_run(&run).unwrap();
+        assert!(!store.abandon_legacy_run("ended").unwrap());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -631,7 +631,7 @@ async fn cancellation_labels_agree_in_runs_status_and_wait() {
             "updatedDisplay":"now", "cancelReason":null, "resultMarkdown":note});
         let stored_contact = (contact["type"] != "live").then(|| contact.to_string());
         db.execute(
-            "UPDATE runs SET status=?1,contact=?2,cancel_requested=?3,cancel_unconfirmed=?4,result_markdown=?5 WHERE id='run'",
+            "UPDATE runs SET status=?1,contact=?2,cancel_requested=?3,cancel_unconfirmed=?4,result_markdown=?5,updated_at=strftime('%s','now')*1000 WHERE id='run'",
             rusqlite::params![status, stored_contact, cancelling, unconfirmed.then_some("[]"), note],
         ).unwrap();
         for args in [

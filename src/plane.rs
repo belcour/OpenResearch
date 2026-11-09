@@ -56,9 +56,12 @@ impl Run {
             run.cancelling |= state.cancel_accepted_at.is_some()
                 && !crate::engine::Phase::parse(&stored.status)
                     .is_some_and(crate::engine::Phase::is_terminal);
-            run.contact = state.contact;
             run.cancel_unconfirmed = state.cancel_unconfirmed;
         }
+        // A legacy row owes its contact to who is watching it, not to the
+        // column alone.
+        run.contact =
+            crate::commands::supervise::effective_contact(store, stored, crate::store::now_ms())?;
         run.host = crate::commands::up::run_host(store, stored)?;
         Ok(run)
     }

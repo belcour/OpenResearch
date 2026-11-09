@@ -1660,6 +1660,115 @@ async fn dashboard_abandon_rejects_live_and_terminal_runs_and_keeps_the_kill() {
     );
 }
 
+fn legacy_run_row(id: &str, updated_at: i64) -> crate::store::StoredRun {
+    crate::store::StoredRun {
+        id: id.into(),
+        experiment_id: "exp".into(),
+        project_id: "project".into(),
+        status: "running".into(),
+        backend_json: r#"{"kind":"ssh_job","namespace":"lab","jobId":"123"}"#.into(),
+        command: "train".into(),
+        created_at: 1,
+        updated_at,
+        ended_at: None,
+        exit_code: None,
+        commit_sha: None,
+        result_markdown: None,
+        cancel_requested: false,
+        cancel_reason: None,
+        chat_session_id: None,
+    }
+}
+
+#[tokio::test]
+async fn dashboard_abandon_releases_a_legacy_run_left_without_a_supervisor() {
+    use tower::ServiceExt;
+    let f = Fixture::new().await;
+    // A row whose last write predates the adopter's settle window has no live contact.
+    f.api
+        .store()
+        .upsert_run(&legacy_run_row("legacy", 1))
+        .unwrap();
+    let app = dashboard_routes(f.api.clone());
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/api/runs/legacy/abandon")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 8192)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["status"], "lost");
+    assert_eq!(value["lostReason"], "abandoned");
+    assert_eq!(value["cancelling"], false);
+    assert_eq!(value["contact"]["type"], "unreconciled");
+    assert_eq!(value["host"], "lab");
+    // The tombstone is final: a second abandon refuses the terminal run.
+    let response = app.oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        "Abandon requires a non-terminal run without live contact"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_abandon_refuses_a_legacy_run_the_supervisor_still_touches() {
+    use tower::ServiceExt;
+    let f = Fixture::new().await;
+    // Touched moments ago: within the settle window the run still owes live contact.
+    f.api
+        .store()
+        .upsert_run(&legacy_run_row("legacy", crate::store::now_ms()))
+        .unwrap();
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/api/runs/legacy/abandon")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    let app = dashboard_routes(f.api.clone());
+    let response = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        "Abandon requires a non-terminal run without live contact"
+    );
+    // A stored report stands as written: the run can still be abandoned.
+    assert!(f
+        .api
+        .store()
+        .set_run_contact(
+            "legacy",
+            &Contact::Unreachable {
+                since: crate::store::now_ms().saturating_sub(60_000),
+                cause: "host unreachable".into(),
+            }
+        )
+        .unwrap());
+    let response = app.oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 8192)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["status"], "lost");
+    assert_eq!(value["lostReason"], "abandoned");
+    assert_eq!(value["contact"]["type"], "unreconciled");
+}
+
 #[tokio::test]
 async fn dashboard_host_routes_report_states_and_retry_only_key_hosts() {
     use crate::engine::transport::{HostClass, HostState, Status};

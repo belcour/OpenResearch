@@ -129,8 +129,12 @@ impl Api {
         value["cancelUnconfirmed"] = json!(state
             .as_ref()
             .and_then(|state| state.cancel_unconfirmed.as_ref()));
-        value["contact"] =
-            serde_json::to_value(state.map_or(Contact::Live, |state| state.contact))?;
+        let contact = crate::commands::supervise::effective_contact(
+            &self.store(),
+            run,
+            crate::store::now_ms(),
+        )?;
+        value["contact"] = serde_json::to_value(contact)?;
         if let Some((failed, error)) = self.store().log_collection(&run.id)? {
             value["logCollection"] = json!(if failed { "failed" } else { "pending" });
             value["logCollectionError"] = json!(error);
@@ -421,17 +425,22 @@ async fn abandon(State(api): State<Arc<Api>>, Path(id): Path<String>) -> ApiResu
 }
 fn abandon_run(api: &Api, id: &str) -> ApiResult<()> {
     let run = api.run(id)?;
-    let contact = api
-        .store()
-        .engine_run_state(id)?
-        .map_or(Contact::Live, |state| state.contact);
+    // What the row owes the user, not what it stores: a legacy run nobody
+    // supervises has effectively lost contact too.
+    let contact =
+        crate::commands::supervise::effective_contact(&api.store(), &run, crate::store::now_ms())?;
     if Phase::parse(&run.status).is_some_and(Phase::is_terminal) || contact == Contact::Live {
         return Err(Failure::Message(
             StatusCode::CONFLICT,
             "Abandon requires a non-terminal run without live contact".into(),
         ));
     }
-    if !api.engine.abandon(id)? {
+    let abandoned = if crate::engine::is_engine_row(&run) {
+        api.engine.abandon(id)?
+    } else {
+        api.store().abandon_legacy_run(id)?
+    };
+    if !abandoned {
         return Err(Failure::Message(
             StatusCode::CONFLICT,
             "Run cannot be abandoned".into(),
