@@ -21,7 +21,8 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
-import { FILE_PREVIEW_BYTES, fmtBytes, type ArtifactEntry, type Project, type ProjectArtifacts } from "../api";
+import { FILE_PREVIEW_BYTES, fmtBytes, type ArtifactEntry, type FileAction, type Project, type ProjectArtifacts } from "../api";
+import { mutDeleteArtifact, mutManageArtifactFile } from "../queries/files";
 import { CodeView } from "./CodeView";
 import { FileTypeIcon, isMarkdownFile } from "./FileTypeIcon";
 import { MediaPreview, mediaPreviewKind, type MediaPreviewKind } from "./MediaPreview";
@@ -530,7 +531,8 @@ export function ArtifactsTab({
 }) {
   const { showConfirmDialog } = useWorkspace().dialogs;
 
-  const { deleteArtifact, manageArtifactFile, revealArtifactInManager, artifactArchiveUrl } = useWorkspace().api;
+  const workspace = useWorkspace();
+  const { revealArtifactInManager, artifactArchiveUrl } = workspace.api;
 
   const runtime = useRuntime();
   const storageProjectId = runtime.kind === "ssh" ? `${encodeURIComponent(runtime.session.host)}:${project.id}` : project.id;
@@ -599,21 +601,10 @@ export function ArtifactsTab({
     });
 
   const remove = async (path: string) => {
-    await deleteArtifact(project.id, path);
-    if (selected === path || selected?.startsWith(path + "/")) setSelected(null);
+    await mutDeleteArtifact.runAsHeadlessPromise(workspace, project.id, path, {});
   };
 
-  const manage = async (
-    path: string,
-    action: Parameters<typeof manageArtifactFile>[2],
-  ) => {
-    try {
-      await manageArtifactFile(project.id, path, action);
-      if (action.action === "rename" && selected === path) setSelected(null);
-    } catch (error) {
-      showAlert(error instanceof Error ? error.message : String(error), "error");
-    }
-  };
+  const manage = (path: string, action: FileAction) => mutManageArtifactFile.run(workspace, project.id, path, action);
 
   const copyPath = (path: string) => {
     if (artifacts) copyFilePath(artifacts.dir, path);
@@ -653,7 +644,7 @@ export function ArtifactsTab({
       }}
       onRename={(path, name) => {
         setRenamingPath(null);
-        void manage(path, { action: "rename", newName: name });
+        manage(path, { action: "rename", newName: name });
       }}
       onCancelRename={() => setRenamingPath(null)}
     />
@@ -712,7 +703,7 @@ export function ArtifactsTab({
           onOpen={contextMenuIsFolder ? undefined : () => onOpenFile(contextMenu.path)}
           onReveal={remote ? undefined : () => void reveal(contextMenu.path)}
           onRename={!contextMenuIsFolder && canRenameFile(contextMenu.path) ? () => setRenamingPath(contextMenu.path) : undefined}
-          onDuplicate={!contextMenuIsFolder ? () => void manage(contextMenu.path, { action: "duplicate" }) : undefined}
+          onDuplicate={!contextMenuIsFolder ? () => manage(contextMenu.path, { action: "duplicate" }) : undefined}
           onCopyPath={() => copyPath(contextMenu.path)}
           onDelete={() => {
             showConfirmDialog({
