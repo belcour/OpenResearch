@@ -1147,7 +1147,7 @@ fn save_images(images: &[ImageAttachment]) -> Result<Vec<SavedAttachment>> {
 /// How much of the model's context window a session has consumed, measured off
 /// the most recent API request the harness reported. Latest report wins (not
 /// cumulative), so auto-compaction naturally drops the number.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextUsage {
     /// Tokens occupying the context window after the most recent API request
@@ -1156,6 +1156,10 @@ pub struct ContextUsage {
     /// Total context window of the model, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Tokens at which the agent compacts on its own; absent when it doesn't
+    /// say or has auto-compaction off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1237,6 +1241,7 @@ pub fn import_native_chat(
     harness: &str,
     native_id: &str,
     title: Option<String>,
+    model: Option<String>,
 ) -> Result<StoredChatSession> {
     if let Some(existing) = store.chat_session_for_native_id(native_id)? {
         return Ok(existing);
@@ -1249,6 +1254,7 @@ pub fn import_native_chat(
         .map(|title| title.trim().to_string())
         .filter(|title| !title.is_empty());
     let session = StoredChatSession {
+        profile_id: None,
         id: format!("chat_{}", uuid::Uuid::new_v4()),
         project_id: project.id.clone(),
         harness: harness.to_string(),
@@ -1258,7 +1264,7 @@ pub fn import_native_chat(
         // not be replaced by the auto-titler on the first turn.
         title_source: title.is_some().then(|| "user".to_string()),
         title,
-        model: None,
+        model,
         service_tier: None,
         permission_mode: None,
         plan_mode: false,
@@ -1330,24 +1336,27 @@ pub fn session_json_with(store: Option<&Store>, s: &StoredChatSession, busy: boo
         .context_usage_json
         .as_deref()
         .and_then(|j| serde_json::from_str::<Value>(j).ok());
-    let native_model = native_configuration.and_then(|configuration| {
-        configuration["configOptions"]
-            .as_array()
-            .and_then(|options| options.iter().find(|option| option["category"] == "model"))
-            .and_then(|option| option["currentValue"].as_str())
-            .or_else(|| configuration["models"]["currentModelId"].as_str())
-    });
+    let native_model = native_configuration.and_then(crate::local::harness::acp::current_model);
+    let native_models = native_configuration
+        .map(|configuration| {
+            let mut models = json!(crate::local::harness::acp::advertised_models(configuration));
+            crate::local::model_routes::name_models(&s.harness, &mut models);
+            models
+        })
+        .filter(|models| models.as_array().is_some_and(|models| !models.is_empty()));
     json!({
         "id": s.id,
         "projectId": s.project_id,
         "harness": s.harness,
+        "profile": s.profile_id,
         "harnessName": acp.as_ref().map(|state| state.launch.name.as_str()),
         "nativeConfiguration": native_configuration,
+        "nativeModels": native_models,
         "title": s.title,
         // The UI animates the reveal of a harness-generated title, so it needs
         // to tell one from a placeholder or a user rename.
         "titleSource": s.title_source,
-        "model": native_model.or(s.model.as_deref()),
+        "model": native_model.or(s.model.as_deref().filter(|m| crate::local::harness::concrete_model(m))),
         "serviceTier": s.service_tier,
         "permissionMode": crate::local::harness::effective_permission_id(
             &s.harness,
@@ -1366,6 +1375,20 @@ pub fn session_json_with(store: Option<&Store>, s: &StoredChatSession, busy: boo
         "goal": s.goal,
         "autonomy": Autonomy::from_stored(s.autonomy.as_deref()).id(),
     })
+}
+
+pub(crate) fn project_model(value: &mut Value, session: &StoredChatSession, catalog: &Value) {
+    if value["model"]
+        .as_str()
+        .is_some_and(crate::local::harness::concrete_model)
+    {
+        return;
+    }
+    value["model"] = json!(crate::local::harness::catalog_default(
+        catalog,
+        &session.harness,
+        session.profile_id.as_deref()
+    ));
 }
 
 fn message_json(m: &WireMessage, session_id: &str) -> Value {
@@ -1627,23 +1650,33 @@ pub(crate) fn kill_shell_group(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
     };
-    let _ = crate::process::command("taskkill")
+    let result = crate::process::command("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .spawn()
+        .and_then(|mut child| {
+            crate::process::wait_with_timeout(&mut child, Duration::from_secs(5))
+        });
+    if let Err(error) = result {
+        eprintln!("orx up: could not stop command group {pid}: {error}");
+    }
 }
 
 /// Kill an agent and every command it started. Agents such as `agy` start each
 /// command in its own session, out of reach of [`kill_shell_group`]; detached
 /// experiment supervisors (`orx supervise`) are spared so their runs continue.
-pub(crate) fn kill_agent_tree(pid: Option<u32>) {
+pub(crate) async fn kill_agent_tree(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
     };
-    stop_process_tree(pid);
     #[cfg(unix)]
-    kill_shell_group(Some(pid));
+    {
+        stop_process_tree(pid);
+        kill_shell_group(Some(pid));
+    }
+    #[cfg(not(unix))]
+    stop_process_tree(pid).await;
 }
 
 #[cfg(unix)]
@@ -1674,6 +1707,57 @@ fn stop_process_tree(pid: u32) {
     unsafe {
         libc::kill(pid, libc::SIGKILL);
     }
+}
+
+/// Whether the agent `pid` still runs a command it started in a session of its
+/// own, as agy starts each of its commands; experiment supervisors don't count.
+/// A process tree it cannot read counts as busy.
+#[cfg(unix)]
+pub(crate) fn runs_a_detached_command(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: getsid only reads the session of a process; one that has exited reads as -1.
+    let session = unsafe { libc::getsid(pid) };
+    if session < 0 {
+        return false;
+    }
+    let snapshot = match crate::process::command("ps")
+        .args(["-ww", "-axo", "pid=,ppid=,args="])
+        .output()
+    {
+        Ok(output) if output.status.success() => output.stdout,
+        _ => {
+            eprintln!("orx up: could not inspect agent descendants of {pid}; keeping it as busy");
+            return true;
+        }
+    };
+    let snapshot = String::from_utf8_lossy(&snapshot);
+    let supervisor_exe = crate::paths::spawnable_exe().ok();
+    let mut parents = vec![pid];
+    while let Some(parent) = parents.pop() {
+        for child in snapshot
+            .lines()
+            .filter_map(|line| tree_child(line, parent, supervisor_exe.as_deref()))
+        {
+            let Ok(child) = libc::pid_t::try_from(child) else {
+                continue;
+            };
+            // SAFETY: as above.
+            match unsafe { libc::getsid(child) } {
+                -1 => {}
+                own if own != session => return true,
+                _ => parents.push(child),
+            }
+        }
+    }
+    false
+}
+
+/// Windows has no sessions to tell a detached command apart.
+#[cfg(not(unix))]
+pub(crate) fn runs_a_detached_command(_pid: u32) -> bool {
+    false
 }
 
 /// The child of `parent` on one `ps -o pid=,ppid=,args=` line, unless it is an
@@ -1707,10 +1791,12 @@ fn is_experiment_supervisor(command: &str, supervisor_exe: Option<&std::path::Pa
 }
 
 #[cfg(not(unix))]
-fn stop_process_tree(pid: u32) {
+async fn stop_process_tree(pid: u32) {
+    // PowerShell sometimes never exits; the caller still kills the agent itself.
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(15);
     let script = r#"
 $ErrorActionPreference = 'Stop'
-$processes = @(Get-CimInstance Win32_Process)
+$processes = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, CommandLine)
 function Stop-TurnProcess([uint32] $processId) {
     $children = @($processes | Where-Object { $_.ParentProcessId -eq $processId })
     Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
@@ -1721,13 +1807,20 @@ function Stop-TurnProcess([uint32] $processId) {
 }
 Stop-TurnProcess ([uint32] $env:ORX_STOP_PID)
 "#;
-    let result = crate::process::command("powershell.exe")
+    let status = crate::process::tokio_command("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .env("ORX_STOP_PID", pid.to_string())
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
+        .kill_on_drop(true)
         .status();
-    if !result.is_ok_and(|status| status.success()) {
-        eprintln!("orx up: could not inspect agent descendants of {pid} while stopping it");
+    match tokio::time::timeout(BOUND, status).await {
+        Ok(Ok(status)) if status.success() => {}
+        Ok(_) => eprintln!("orx up: could not inspect agent descendants of {pid} while stopping it"),
+        Err(_) => eprintln!(
+            "orx up: PowerShell did not list the agent descendants of {pid} within {}s; stopping only the agent",
+            BOUND.as_secs()
+        ),
     }
 }
 
@@ -1772,7 +1865,7 @@ mod agent_tree_tests {
             pid,
             "command must lead its group"
         );
-        super::kill_agent_tree(child.id());
+        super::kill_agent_tree(child.id()).await;
         child.wait().await.unwrap();
         for _ in 0..100 {
             if unsafe { libc::kill(pid, 0) } != 0 {
@@ -1828,7 +1921,7 @@ impl ChatHost {
         let session = store
             .get_chat_session(session_id)?
             .ok_or_else(|| anyhow!("chat session not found"))?;
-        if session.harness == agent.harness {
+        if session.harness == agent.harness && session.profile_id == agent.profile {
             if session.model == agent.model {
                 guard.release().await;
                 return Ok(session);
@@ -1874,22 +1967,27 @@ impl ChatHost {
                 .as_deref()
                 .map(|leaf| active_path(&messages, Some(leaf)))
                 .unwrap_or_default();
-            let resume = path
-                .iter()
-                .rev()
-                .find(|message| message.native_harness.as_deref() == Some(&agent.harness))
-                .and_then(|message| {
-                    message
-                        .result_native_session_id
-                        .clone()
-                        .or(message.base_native_session_id.clone())
-                });
+            let resume = if session.harness == agent.harness {
+                session.native_session_id.clone()
+            } else {
+                path.iter()
+                    .rev()
+                    .find(|message| message.native_harness.as_deref() == Some(&agent.harness))
+                    .and_then(|message| {
+                        message
+                            .result_native_session_id
+                            .clone()
+                            .or(message.base_native_session_id.clone())
+                    })
+            };
             (resume, None)
         };
         let mut part = WirePart::tool("provider_switch", handoff::SWITCH_TOOL, "completed", None);
         part.state.as_mut().unwrap().input = Some(json!({
             "fromHarness": session.harness,
             "fromModel": session.model,
+            "fromProfile": session.profile_id,
+            "profile": agent.profile,
             "harness": agent.harness,
             "name": target.name(),
             "model": agent.model,
@@ -1951,7 +2049,7 @@ impl ChatHost {
                 .ok_or_else(|| anyhow!("chat session is gone"))?
         };
         let harness = crate::local::harness::session_harness(&session.harness, session_id)
-            .ok_or_else(|| anyhow!("unknown harness `{}`", session.harness))?;
+            .ok_or_else(|| anyhow!("unknown agent `{}`", session.harness))?;
         if !harness.supports_compaction() {
             return Err(anyhow!("Compaction is not supported by {}", harness.name()));
         }
@@ -2055,8 +2153,12 @@ impl ChatHost {
         snapshot: &str,
     ) -> Result<Option<String>> {
         let harness = crate::local::harness::session_harness(&session.harness, session_id)
-            .ok_or_else(|| anyhow!("unknown harness `{}`", session.harness))?;
+            .ok_or_else(|| anyhow!("unknown agent `{}`", session.harness))?;
+        if let Some(profile) = &session.profile_id {
+            crate::local::agent_profiles::home(profile, &session.harness)?;
+        }
         let ctx = crate::local::harness::CompactCtx {
+            profile: session.profile_id.clone(),
             host: self.clone(),
             session_id: session_id.to_string(),
             // A pending fork's native session holds other forks' turns, so
@@ -2072,6 +2174,7 @@ impl ChatHost {
             permission_mode: session.permission_mode.as_deref().and_then(|mode| {
                 crate::local::harness::permission_mode_for(&session.harness, mode)
             }),
+            plan_mode: session.plan_mode,
             service_tier: session.service_tier.clone(),
             reasoning_level: session.reasoning_level.clone(),
         };
@@ -2132,6 +2235,7 @@ impl ChatHost {
         let prompt = format!("<orx-transcript>\n{snapshot}\n</orx-transcript>");
         let summary = harness
             .one_shot(crate::local::harness::OneShot {
+                profile: session.profile_id.as_deref(),
                 system: COMPACT_SYSTEM_PROMPT,
                 prompt: &prompt,
                 quality: crate::local::harness::OneShotQuality::Standard,
@@ -2672,6 +2776,7 @@ impl Drop for PendingGuard {
 
 /// Owns turn tasks and the chat event stream. One per `orx up` process.
 pub struct ChatHost {
+    pub(crate) harnesses: Arc<Mutex<Option<(std::time::Instant, Value)>>>,
     /// Lazy opencode serve manager (only the opencode adapter spawns it).
     pub opencode: Arc<AgentHost>,
     /// Lazy codex app-server manager (only the codex adapter spawns it).
@@ -3572,35 +3677,24 @@ impl TurnGuard {
             return;
         }
         self.armed = false;
-        let (removed, drain_queued) = {
+        let claude = self.host.claude.live(&self.session_id).await;
+        let next = {
             let mut turns = self.host.turns.lock().await;
-            if matches!(
+            if !matches!(
                 turns.get(&self.session_id),
                 Some(TurnState::Reserved { .. } | TurnState::Switching)
             ) {
-                let drain_queued = self.host.drains_queue(&self.session_id);
-                if drain_queued {
-                    turns.insert(self.session_id.clone(), TurnState::Draining);
-                } else {
-                    self.host.release_durable_turn(&self.session_id);
-                    turns.remove(&self.session_id);
-                }
-                (true, drain_queued)
-            } else {
-                (false, false)
+                return;
             }
+            let drains = self.host.drains_queue(&self.session_id);
+            self.host
+                .pass_slot(&mut turns, &self.session_id, drains, claude.as_deref())
         };
-        if removed {
-            self.host.emit(
-                "chat.busy",
-                json!({ "sessionId": &self.session_id, "busy": drain_queued }),
-            );
-            if drain_queued {
-                self.host.drain_queue(&self.session_id).await;
-            } else {
-                self.host.record_held_continuation(&self.session_id);
-            }
-        }
+        self.host.emit(
+            "chat.busy",
+            json!({ "sessionId": &self.session_id, "busy": next != SlotHolder::None }),
+        );
+        self.host.start_slot_holder(&self.session_id, next).await;
     }
 }
 
@@ -3611,38 +3705,18 @@ impl Drop for TurnGuard {
         }
         let host = self.host.clone();
         let session_id = self.session_id.clone();
-        tokio::spawn(async move {
-            let (removed, drain_queued) = {
-                let mut turns = host.turns.lock().await;
-                if matches!(
-                    turns.get(&session_id),
-                    Some(TurnState::Reserved { .. } | TurnState::Switching)
-                ) {
-                    let drain_queued = host.drains_queue(&session_id);
-                    if drain_queued {
-                        turns.insert(session_id.clone(), TurnState::Draining);
-                    } else {
-                        host.release_durable_turn(&session_id);
-                        turns.remove(&session_id);
-                    }
-                    (true, drain_queued)
-                } else {
-                    (false, false)
-                }
-            };
-            if removed {
-                host.emit(
-                    "chat.busy",
-                    json!({ "sessionId": &session_id, "busy": drain_queued }),
-                );
-                if drain_queued {
-                    host.drain_queue(&session_id).await;
-                } else {
-                    host.record_held_continuation(&session_id);
-                }
-            }
-        });
+        tokio::spawn(async move { TurnGuard::adopt(&host, &session_id).release().await });
     }
+}
+
+/// Who takes a turn slot as its turn gives it up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotHolder {
+    /// The next queued user message.
+    Queue,
+    /// What the chat's Claude child began on its own while the slot was taken.
+    HeldReply,
+    None,
 }
 
 /// RAII registration of a turn's steering sink. An aborted turn's guard can
@@ -3685,6 +3759,7 @@ impl ChatHost {
             }
         }
         Self {
+            harnesses: Arc::new(Mutex::new(None)),
             opencode,
             codex,
             claude,
@@ -4055,6 +4130,27 @@ impl ChatHost {
         self.acp.shutdown().await;
     }
 
+    pub async fn remove_harness_install(
+        &self,
+        store: Store,
+        harness: &str,
+        removal: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<bool> {
+        let key = crate::local::harness::managed::removable_key(harness)?;
+        let turns = self.turns.lock().await;
+        let sessions = store.chat_session_ids_for_agent(harness, &key)?;
+        for session in &sessions {
+            if turns.contains_key(session) || store.chat_turn_leased(session)? {
+                return Ok(false);
+            }
+        }
+        for session in &sessions {
+            self.acp.stop(session).await;
+        }
+        removal.await?;
+        Ok(true)
+    }
+
     pub async fn busy_sessions(&self) -> Vec<String> {
         self.turns.lock().await.keys().cloned().collect()
     }
@@ -4073,9 +4169,22 @@ impl ChatHost {
     }
 
     pub async fn interrupt_all(self: &Arc<Self>) {
-        for session_id in self.busy_sessions().await {
-            let _ = self.interrupt(&session_id).await;
-        }
+        let sessions = self.busy_sessions().await;
+        futures::future::join_all(sessions.iter().map(|session_id| self.interrupt(session_id)))
+            .await;
+    }
+
+    /// Stop every active turn for server shutdown without marking it cancelled,
+    /// so lease reconciliation on the next startup still offers Continue/Retry.
+    /// Stops run together so shutdown waits on the slowest agent, not the sum.
+    pub async fn stop_for_shutdown(self: &Arc<Self>) {
+        let sessions = self.busy_sessions().await;
+        let stops = sessions.iter().map(|session_id| async move {
+            if let Err(error) = self.stop_turn(session_id, StopMode::Shutdown).await {
+                eprintln!("orx up: failed to stop turn {session_id} for shutdown: {error}");
+            }
+        });
+        futures::future::join_all(stops).await;
     }
 
     pub async fn is_busy(&self, session_id: &str) -> bool {
@@ -5235,18 +5344,18 @@ impl ChatHost {
         if !supports_command_plan {
             settings.plan_mode = None;
             if explicit_overrides.plan_mode.is_some() {
-                return Err(anyhow!("this harness activates Plan through permissions"));
+                return Err(anyhow!("this agent activates Plan through permissions"));
             }
         }
         explicit_overrides.apply_to(&mut settings);
         if let Some(mode) = settings.permission_mode.as_deref() {
             if crate::local::harness::permission_mode_for(&session.harness, mode).is_none() {
-                return Err(anyhow!("invalid permission mode for selected harness"));
+                return Err(anyhow!("invalid permission mode for the selected agent"));
             }
         }
         if let Some(tier) = settings.service_tier.as_deref() {
             if crate::local::harness::service_tier_for(&session.harness, tier).is_none() {
-                return Err(anyhow!("invalid speed for selected harness"));
+                return Err(anyhow!("invalid speed for the selected agent"));
             }
         }
         match action {
@@ -5803,7 +5912,7 @@ impl ChatHost {
             .filter(|m| !m.is_empty())
         {
             if crate::local::harness::permission_mode_for(&session.harness, mode).is_none() {
-                return Err(anyhow!("invalid permission mode for selected harness"));
+                return Err(anyhow!("invalid permission mode for the selected agent"));
             }
         }
         if let Some(tier) = overrides
@@ -5812,13 +5921,13 @@ impl ChatHost {
             .filter(|tier| !tier.is_empty())
         {
             if crate::local::harness::service_tier_for(&session.harness, tier).is_none() {
-                return Err(anyhow!("invalid speed for selected harness"));
+                return Err(anyhow!("invalid speed for the selected agent"));
             }
         }
         if overrides.plan_mode.is_some()
             && !crate::local::harness::supports_command_plan(&session.harness)
         {
-            return Err(anyhow!("this harness activates Plan through permissions"));
+            return Err(anyhow!("this agent activates Plan through permissions"));
         }
         // Atomically claim the session's turn slot: the busy-check and the
         // reservation happen under one lock so two concurrent sends (or a
@@ -6013,6 +6122,9 @@ impl ChatHost {
                 )
             }
         };
+        session = store
+            .get_chat_session(session_id)?
+            .ok_or_else(|| anyhow!("chat session not found"))?;
         let reset_codex_model = if overrides.clear_model && session.harness == "codex" {
             match session.native_session_id.as_deref() {
                 Some(native_id) => {
@@ -6059,6 +6171,46 @@ impl ChatHost {
                 store.set_chat_session_model(&session.id, &model)?;
                 session.model = Some(model);
             }
+        }
+        if session
+            .model
+            .as_deref()
+            .is_none_or(|model| !crate::local::harness::concrete_model(model))
+            && !overrides.clear_model
+        {
+            let catalog = self.harnesses.lock().await.clone();
+            let payload = catalog.as_ref().map(|(_, payload)| payload);
+            let native = store
+                .acp_session_state(&session.id)?
+                .as_ref()
+                .filter(|state| state.launch.id == session.harness)
+                .and_then(|state| {
+                    crate::local::harness::acp::current_model(&state.configuration)
+                        .filter(|model| crate::local::harness::concrete_model(model))
+                        .map(str::to_owned)
+                });
+            let recovered = match (payload, session.native_session_id.as_deref()) {
+                (Some(payload), Some(id)) if native.is_none() => {
+                    crate::local::native_chats::selection_model(
+                        payload,
+                        &session.harness,
+                        session.profile_id.as_deref(),
+                        id,
+                    )?
+                }
+                _ => None,
+            };
+            let model = native.or(recovered).or_else(|| {
+                payload.and_then(|payload| {
+                    crate::local::harness::catalog_default(
+                        payload,
+                        &session.harness,
+                        session.profile_id.as_deref(),
+                    )
+                })
+            });
+            store.set_chat_session_model_value(&session.id, model.as_deref())?;
+            session.model = model;
         }
         if let Some(tier) = overrides.service_tier.filter(|tier| !tier.is_empty()) {
             if session.service_tier.as_deref() != Some(tier.as_str()) {
@@ -6410,6 +6562,7 @@ impl ChatHost {
         let turn_id = ctx.turn_id.clone();
         let harness = ctx.harness.clone();
         let model = ctx.model.clone();
+        let profile = ctx.profile.clone();
         let (target_path, target_event_offset) = target_event_start(&sid, &ctx.assistant.id);
         ctx.target_event_path = Some(target_path);
         ctx.target_event_offset = target_event_offset;
@@ -6436,14 +6589,27 @@ impl ChatHost {
                     None,
                 )
             });
-            let result = match crate::local::harness::session_harness(&ctx.harness, &ctx.session_id)
-            {
-                Some(harness) => harness.run_turn(&mut ctx).await,
-                None => Err(crate::local::harness::TurnFailure {
-                    kind: "unknown_harness",
-                    message: format!("unknown harness: {}", ctx.harness),
-                    delivery: DeliveryState::Rejected,
+            let profile = ctx
+                .profile
+                .as_deref()
+                .map(|id| crate::local::agent_profiles::home(id, &ctx.harness))
+                .transpose();
+            let result = match profile {
+                Err(error) => Err(crate::local::harness::TurnFailure {
+                    kind: "profile_removed",
+                    message: error.to_string(),
+                    delivery: DeliveryState::NotSent,
                 }),
+                Ok(_) => {
+                    match crate::local::harness::session_harness(&ctx.harness, &ctx.session_id) {
+                        Some(harness) => harness.run_turn(&mut ctx).await,
+                        None => Err(crate::local::harness::TurnFailure {
+                            kind: "unknown_harness",
+                            message: format!("unknown agent: {}", ctx.harness),
+                            delivery: DeliveryState::Rejected,
+                        }),
+                    }
+                }
             };
             drop(steer_route);
             if let Some(mut steering) = ctx.steering.take() {
@@ -6541,7 +6707,7 @@ impl ChatHost {
             }),
         );
         if let Some(seed) = title_seed {
-            self.spawn_title_generation(sid, harness, seed, model);
+            self.spawn_title_generation(sid, harness, seed, model, profile);
         }
         guard.defuse();
         Ok(TurnSubmission::Started(turn_id))
@@ -6571,7 +6737,8 @@ impl ChatHost {
         } else {
             None
         };
-        let reserved_queue = {
+        let claude = self.claude.live(session_id).await;
+        let next = {
             let refreshed = self.refresh_persisted_queue(session_id).is_ok();
             let mut turns = self.turns.lock().await;
             let matches = match (turns.get(session_id), message_id) {
@@ -6584,28 +6751,21 @@ impl ChatHost {
             if !matches {
                 return;
             }
-            let reserved_queue = message_id.is_some() && refreshed && self.drains_queue(session_id);
-            if reserved_queue {
-                turns.insert(session_id.to_string(), TurnState::Draining);
-            } else {
-                self.release_durable_turn(session_id);
-                turns.remove(session_id);
-            }
-            reserved_queue
+            let drains = message_id.is_some() && refreshed && self.drains_queue(session_id);
+            self.pass_slot(&mut turns, session_id, drains, claude.as_deref())
         };
+        let busy = next != SlotHolder::None;
         if let Some(session) = session {
             self.emit(
                 "chat.session",
-                json!({ "session": session_json(&session, reserved_queue) }),
+                json!({ "session": session_json(&session, busy) }),
             );
         }
         self.emit(
             "chat.busy",
-            json!({ "sessionId": session_id, "busy": reserved_queue }),
+            json!({ "sessionId": session_id, "busy": busy }),
         );
-        if !reserved_queue {
-            self.record_held_continuation(session_id);
-        }
+        self.start_slot_holder(session_id, next).await;
     }
 
     async fn finish_interruption(self: &Arc<Self>, session_id: &str) {
@@ -6615,7 +6775,7 @@ impl ChatHost {
     /// Records what a resident Claude child wrote on its own after its turn
     /// ended, such as its reply once a background task finished, as a turn with
     /// no user message. While the chat is busy the lines wait: its next Claude
-    /// turn folds them in, or the freed slot records them here.
+    /// turn folds them in, or the slot passes to them as its turn ends.
     pub(crate) async fn record_continuation(self: &Arc<Self>, session_id: &str) {
         let Some(mut guard) = TurnGuard::claim(self, session_id, None).await else {
             return;
@@ -6624,7 +6784,11 @@ impl ChatHost {
             guard.release().await;
             return;
         }
+        self.record_claimed_continuation(session_id, guard).await;
+    }
 
+    /// Records the segment `claim_continuation` marked, in the slot `guard` holds.
+    async fn record_claimed_continuation(self: &Arc<Self>, session_id: &str, guard: TurnGuard) {
         let request = SendTurnRequest {
             messages: Vec::new(),
             prepared_input: Some(String::new()),
@@ -6647,15 +6811,63 @@ impl ChatHost {
         }
     }
 
-    /// Starts recording a segment the chat's Claude child began while its slot
-    /// was taken; call once the slot is free.
+    /// Gives up a turn slot under the turn map's lock: to the next queued
+    /// message when `drains`, else to a segment the chat's `claude` child began
+    /// on its own meanwhile, claiming it, else frees it. Claiming before the slot
+    /// reads as free leaves no later check to take it from whoever claims next.
+    fn pass_slot(
+        &self,
+        turns: &mut HashMap<String, TurnState>,
+        session_id: &str,
+        drains: bool,
+        claude: Option<&crate::local::claude::ClaudeClient>,
+    ) -> SlotHolder {
+        let admitting = !self.exiting.load(std::sync::atomic::Ordering::SeqCst)
+            && !self.deleting_sessions.lock().unwrap().contains(session_id);
+        let next = if drains {
+            SlotHolder::Queue
+        } else if admitting
+            && claude.is_some_and(crate::local::claude::ClaudeClient::claim_continuation)
+        {
+            SlotHolder::HeldReply
+        } else {
+            SlotHolder::None
+        };
+        match next {
+            SlotHolder::Queue => {
+                turns.insert(session_id.to_string(), TurnState::Draining);
+            }
+            SlotHolder::HeldReply => {
+                turns.insert(
+                    session_id.to_string(),
+                    TurnState::Reserved { turn_id: None },
+                );
+            }
+            SlotHolder::None => {
+                self.release_durable_turn(session_id);
+                turns.remove(session_id);
+            }
+        }
+        next
+    }
+
+    async fn start_slot_holder(self: &Arc<Self>, session_id: &str, next: SlotHolder) {
+        match next {
+            SlotHolder::Queue => self.drain_queue(session_id).await,
+            SlotHolder::HeldReply => self.record_held_continuation(session_id),
+            SlotHolder::None => {}
+        }
+    }
+
+    /// Records the segment [`Self::pass_slot`] passed the slot to. Not
+    /// async: the recording turn's own release leads back here, and the
+    /// compiler cannot prove such a cycle of futures `Send`.
     fn record_held_continuation(self: &Arc<Self>, session_id: &str) {
         let chat = self.clone();
         let session_id = session_id.to_string();
         tokio::spawn(async move {
-            if chat.claude.has_continuation(&session_id).await {
-                chat.record_continuation(&session_id).await;
-            }
+            let guard = TurnGuard::adopt(&chat, &session_id);
+            chat.record_claimed_continuation(&session_id, guard).await;
         });
     }
 
@@ -6664,12 +6876,11 @@ impl ChatHost {
     /// stops generating. Returns whether a turn (or a reservation) was
     /// actually aborted — `false` means the session was already idle.
     pub async fn interrupt(self: &Arc<Self>, session_id: &str) -> Result<bool> {
-        self.stop_turn(session_id, true).await
+        self.stop_turn(session_id, StopMode::Cancel).await
     }
 
-    /// `cancel` records the turn as stopped on purpose; without it the stored
-    /// turn is left for lease reconciliation, which offers a way to continue.
-    async fn stop_turn(self: &Arc<Self>, session_id: &str, cancel: bool) -> Result<bool> {
+    async fn stop_turn(self: &Arc<Self>, session_id: &str, mode: StopMode) -> Result<bool> {
+        let cancel = mode == StopMode::Cancel;
         let active = {
             let mut turns = self.turns.lock().await;
             let Some(state) = turns.get_mut(session_id) else {
@@ -6743,10 +6954,14 @@ impl ChatHost {
                 }
                 None
             };
-            let interrupted_items = tokio::time::timeout(Duration::from_secs(10), native_shutdown)
-                .await
-                .ok()
-                .flatten();
+            let interrupted_items = if mode == StopMode::Shutdown {
+                None
+            } else {
+                tokio::time::timeout(Duration::from_secs(10), native_shutdown)
+                    .await
+                    .ok()
+                    .flatten()
+            };
             if let Some(active) = active {
                 let _ = active.handle.await;
                 let _ = Store::open().and_then(|store| {
@@ -6918,11 +7133,11 @@ impl ChatHost {
         }
         if let Some(mode) = req.resume_mode.as_deref() {
             if crate::local::harness::permission_mode_for(&session.harness, mode).is_none() {
-                return Err(anyhow!("invalid resume mode for selected harness"));
+                return Err(anyhow!("invalid resume mode for the selected agent"));
             }
         }
         let harness = crate::local::harness::session_harness(&session.harness, &session.id)
-            .ok_or_else(|| anyhow!("unknown harness: {}", session.harness))?;
+            .ok_or_else(|| anyhow!("unknown agent: {}", session.harness))?;
 
         // Ask the harness how the answer resumes. Inline harnesses deliver the
         // reply to their live process here and return `Handled`; end-turn
@@ -7102,6 +7317,14 @@ impl ChatHost {
         }
     }
 
+    pub(crate) async fn session_json(&self, session: &StoredChatSession, busy: bool) -> Value {
+        let mut value = session_json(session, busy);
+        if let Some((_, payload)) = self.harnesses.lock().await.as_ref() {
+            project_model(&mut value, session, payload);
+        }
+        value
+    }
+
     /// Broadcast a freshly re-read session row, resolving `busy` live from the
     /// turn map.
     ///
@@ -7128,7 +7351,7 @@ impl ChatHost {
         let busy = self.is_busy(&session.id).await;
         self.emit(
             "chat.session",
-            json!({ "session": session_json(&session, busy) }),
+            json!({ "session": self.session_json(&session, busy).await }),
         );
         Some(session)
     }
@@ -7148,13 +7371,22 @@ impl ChatHost {
     /// Branch a side chat off `parent`, seeded with a snapshot of the parent's
     /// live branch as it is right now.
     pub async fn open_side_chat(&self, parent: &StoredChatSession) -> Result<StoredChatSession> {
+        let catalog = self.harnesses.lock().await.clone();
         let store = Store::open()?;
         let transaction = store.begin_immediate()?;
         let parent = store
             .get_chat_session(&parent.id)?
             .ok_or_else(|| anyhow!("chat session is gone"))?;
         let messages = store.list_chat_messages(&parent.id)?;
-        let session = side_chat_session(&parent, &messages);
+        let mut session = side_chat_session(&parent, &messages);
+        if let Some((_, payload)) = catalog.as_ref() {
+            session.model = crate::local::harness::selected_model(
+                payload,
+                &session.harness,
+                session.profile_id.as_deref(),
+                session.model.as_deref(),
+            )?;
+        }
         store.create_chat_session(&session)?;
         transaction.commit()?;
         // Checked after the insert: a parent delete that began earlier has
@@ -7203,7 +7435,7 @@ impl ChatHost {
             return Ok(None);
         };
         if !crate::local::harness::supports_command_plan(&session.harness) {
-            return Err(anyhow!("this harness activates Plan through permissions"));
+            return Err(anyhow!("this agent activates Plan through permissions"));
         }
         {
             let mut changes = self.plan_changes.lock().unwrap();
@@ -7284,7 +7516,7 @@ impl ChatHost {
             return Ok(None);
         };
         if crate::local::harness::permission_mode_for(&session.harness, permission_mode).is_none() {
-            return Err(anyhow!("invalid permission mode for selected harness"));
+            return Err(anyhow!("invalid permission mode for the selected agent"));
         }
         {
             let mut changes = self.permission_changes.lock().unwrap();
@@ -7313,6 +7545,7 @@ impl ChatHost {
         harness_id: String,
         first_message: String,
         model: Option<String>,
+        profile: Option<String>,
     ) {
         let host = self.clone();
         tokio::spawn(async move {
@@ -7320,7 +7553,7 @@ impl ChatHost {
                 return;
             };
             let Some(title) = harness
-                .generate_title(&first_message, model.as_deref())
+                .generate_title(&first_message, model.as_deref(), profile.as_deref())
                 .await
             else {
                 return;
@@ -7971,6 +8204,7 @@ fn resolve_permission_change(
 }
 
 pub struct TurnCtx {
+    pub profile: Option<String>,
     pub host: Arc<ChatHost>,
     pub turn_id: String,
     /// What the turn's message last showed it waiting on, so the session
@@ -8063,6 +8297,7 @@ fn turn_ctx_from_stored(
     }
 
     Ok(TurnCtx {
+        profile: session.profile_id.clone(),
         host,
         turn_id: turn.id.clone(),
         durable: true,
@@ -8213,7 +8448,12 @@ impl TurnCtx {
         &self,
         prefix: &str,
         native_scope: &str,
-        samples: &[(String, Option<String>, crate::store::TokenUsage)],
+        samples: &[(
+            String,
+            Option<String>,
+            crate::store::TokenUsage,
+            Option<crate::store::Cost>,
+        )],
     ) {
         if !self.durable {
             return;
@@ -8240,16 +8480,23 @@ impl TurnCtx {
         self.attempt_count
     }
 
+    /// Records a sample that may sum several requests, so the price list never applies a
+    /// context tier to it.
     pub(crate) fn record_native_usage(
         &self,
         sample_id: &str,
         model: Option<&str>,
         provider: Option<&str>,
         usage: crate::store::TokenUsage,
+        cost: Option<crate::store::Cost>,
     ) {
         if !self.durable {
             return;
         }
+        let cost = match &cost {
+            Some(cost) => crate::store::SampleCost::Reported(cost),
+            None => crate::store::SampleCost::Unreported { one_request: false },
+        };
         if let Err(error) = Store::open().and_then(|store| {
             store.record_usage_sample(
                 &self.usage_execution_id,
@@ -8258,6 +8505,7 @@ impl TurnCtx {
                 model,
                 provider,
                 &usage,
+                cost,
             )
         }) {
             eprintln!("orx up: could not persist native token usage: {error}");
@@ -8443,16 +8691,15 @@ impl TurnCtx {
         self.upsert_part_raw(part);
     }
 
-    fn upsert_part_raw(&mut self, part: WirePart) {
+    pub(crate) fn upsert_part_raw(&mut self, part: WirePart) {
         upsert_preserving_children(&mut self.assistant.parts, part);
     }
 
-    /// Bare in-memory ctx for harness unit tests: parts accumulate on
-    /// `assistant`, nothing is flushed or persisted (don't call `flush` /
-    /// `set_native_session_id` on it — those touch the store).
+    /// Harness test context; persistence methods use the test store.
     #[cfg(test)]
     pub fn test_stub() -> Self {
         Self {
+            profile: None,
             host: Arc::new(ChatHost::new(
                 Arc::new(AgentHost::new(None)),
                 Arc::new(crate::local::codex::CodexHost::new()),
@@ -8650,13 +8897,46 @@ impl TurnCtx {
 
     /// Record the latest context-window usage a harness reported and stream it
     /// live over `chat.usage`. Merging: a report that omits `context_window`
-    /// inherits the previously-known value (an `assistant` event carries the
-    /// token count but not the window; the `result` event fills the window).
+    /// or `compact_at` inherits the previously-known value (an `assistant`
+    /// event carries the token count but not the window; the `result` event
+    /// fills the window).
     pub fn report_usage(&mut self, mut usage: ContextUsage) {
         if let Some(prev) = &self.context_usage {
             if usage.context_window.is_none() {
                 usage.context_window = prev.context_window;
             }
+            if usage.compact_at.is_none() {
+                usage.compact_at = prev.compact_at;
+            }
+        }
+        self.publish_usage(usage);
+    }
+
+    /// Record where the agent compacts on its own, or that it no longer does,
+    /// which a merging `report_usage` can't say.
+    pub fn report_compact_at(&mut self, compact_at: Option<u64>) {
+        let Some(usage) = &self.context_usage else {
+            return;
+        };
+        if usage.compact_at != compact_at {
+            self.publish_usage(ContextUsage {
+                compact_at,
+                ..usage.clone()
+            });
+        }
+    }
+
+    fn publish_usage(&mut self, usage: ContextUsage) {
+        if self.context_usage.as_ref() == Some(&usage) {
+            return;
+        }
+        if self.durable {
+            let _ = Store::open().and_then(|store| {
+                store.set_chat_session_context_usage(
+                    &self.session_id,
+                    &serde_json::to_string(&usage)?,
+                )
+            });
         }
         self.context_usage = Some(usage.clone());
         self.host.emit(
@@ -8811,54 +9091,64 @@ impl TurnCtx {
         // (else that reconcile-then-clobber is a lost update). Only pay the lock
         // when this message actually carries a prompt part.
         let has_prompt = self.assistant.parts.iter().any(|p| p.prompt.is_some());
-        let wire_assistant = {
+        {
             // Clone the host handle so the guard borrows it, not `self` — the
             // reconcile below needs `&mut self`.
             let host = self.host.clone();
             let _guard = has_prompt.then(|| host.msg_write.lock().unwrap());
+            let stored = store.get_chat_message(&self.assistant.id)?;
             if has_prompt {
-                self.adopt_resolved_prompts(&store);
+                self.adopt_resolved_prompts(stored.as_ref());
             }
-            let mut wire_assistant = self.assistant.clone();
-            cap_tool_parts(&mut wire_assistant.parts);
-            // Stamp the branch position onto the SSE copy (see the interrupt
-            // marker above for what an unparented broadcast does to a client).
-            wire_assistant.parent_id = store.upsert_chat_message_on_branch(&StoredChatMessage {
-                id: wire_assistant.id.clone(),
-                session_id: self.session_id.clone(),
-                role: wire_assistant.role.clone(),
-                parts_json: serde_json::to_string(&wire_assistant.parts)?,
-                created_at: wire_assistant.created_at,
-                completed_at: wire_assistant.completed_at,
-                parent_id: None,
-                base_native_session_id: None,
-                result_native_session_id: self.native_session_id.clone(),
-                result_native_message_id: self.native_message_id.clone(),
-                native_harness: Some(self.harness.clone()),
-            })?;
-            wire_assistant
-        };
+            let parts_json = serde_json::to_string(&self.assistant.parts)?;
+            let unchanged = stored.as_ref().is_some_and(|stored| {
+                stored.parts_json == parts_json
+                    && stored.completed_at == self.assistant.completed_at
+                    && stored.result_native_session_id == self.native_session_id
+                    && stored.result_native_message_id == self.native_message_id
+                    && stored.native_harness.as_deref() == Some(self.harness.as_str())
+            });
+            if !unchanged {
+                let mut wire_assistant = self.assistant.clone();
+                // Stamp the branch position onto the SSE copy (see the interrupt
+                // marker above for what an unparented broadcast does to a client).
+                wire_assistant.parent_id =
+                    store.upsert_chat_message_on_branch(&StoredChatMessage {
+                        id: wire_assistant.id.clone(),
+                        session_id: self.session_id.clone(),
+                        role: wire_assistant.role.clone(),
+                        parts_json,
+                        created_at: wire_assistant.created_at,
+                        completed_at: wire_assistant.completed_at,
+                        parent_id: None,
+                        base_native_session_id: None,
+                        result_native_session_id: self.native_session_id.clone(),
+                        result_native_message_id: self.native_message_id.clone(),
+                        native_harness: Some(self.harness.clone()),
+                    })?;
+                self.host.emit(
+                    "chat.message",
+                    message_json(&wire_assistant, &self.session_id),
+                );
+            }
+        }
         // A delegate's card shows what it waits on, so a card appearing or
         // resolved mid-turn re-sends its session.
-        let asking = wire_assistant.parts.iter().find_map(|part| {
+        let asking = self.assistant.parts.iter().find_map(|part| {
             part.prompt
                 .as_ref()
                 .filter(|prompt| !prompt.resolved)
                 .map(|prompt| prompt.kind.clone())
         });
         if asking != self.asking {
-            self.asking = asking;
             if let Some(session) = store.get_chat_session(&self.session_id)? {
                 self.host.emit(
                     "chat.session",
                     json!({ "session": session_json(&session, true) }),
                 );
             }
+            self.asking = asking;
         }
-        self.host.emit(
-            "chat.message",
-            message_json(&wire_assistant, &self.session_id),
-        );
         self.last_flushed_tool_states = tool_state_signature(&self.assistant.parts);
         self.last_attempted_tool_states = self.last_flushed_tool_states.clone();
         Ok(())
@@ -8871,8 +9161,8 @@ impl TurnCtx {
     /// so it's safe regardless of ordering: the in-memory copy normally never
     /// carries an echo of its own, and dropping the stored one here would
     /// erase the stamped outcome on the next flush.
-    fn adopt_resolved_prompts(&mut self, store: &Store) {
-        let Ok(Some(stored)) = store.get_chat_message(&self.assistant.id) else {
+    fn adopt_resolved_prompts(&mut self, stored: Option<&StoredChatMessage>) {
+        let Some(stored) = stored else {
             return;
         };
         let persisted: Vec<WirePart> = serde_json::from_str(&stored.parts_json).unwrap_or_default();
@@ -9081,6 +9371,7 @@ fn side_chat_session(
     };
     let now = now_ms();
     StoredChatSession {
+        profile_id: parent.profile_id.clone(),
         id: format!("chat_{}", uuid::Uuid::new_v4()),
         project_id: parent.project_id.clone(),
         harness: parent.harness.clone(),
@@ -9495,12 +9786,23 @@ pub async fn keep_turn_leases(
     }
 }
 
+/// How [`ChatHost::stop_turn`] leaves a turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopMode {
+    /// Stopped on purpose: the stored turn is recorded as interrupted.
+    Cancel,
+    /// Cut short: the stored turn is left for lease reconciliation, which offers Continue.
+    LeaseLost,
+    /// Cut short like `LeaseLost`, without waiting on the agent: shutdown kills it next.
+    Shutdown,
+}
+
 /// A turn whose lease another claim reaped stops here and is recorded as cut
 /// short, with a way to continue.
 async fn stop_turns_whose_lease_was_lost(chat: &Arc<ChatHost>) {
     let lost = chat.renew_turn_leases();
     for session_id in &lost {
-        let _ = chat.stop_turn(session_id, false).await;
+        let _ = chat.stop_turn(session_id, StopMode::LeaseLost).await;
     }
     if lost.is_empty() {
         return;
@@ -9665,16 +9967,23 @@ fn bash_env_hook(original: Option<String>) -> String {
     ) + PATH_GUARD
 }
 
+/// The user's shell setup a harness child inherits. Never the developer's under
+/// test, whose startup files a tool shell would otherwise run.
 fn child_env_value(key: &str) -> Option<std::ffi::OsString> {
-    std::env::var_os(key).or_else(|| {
+    let inherited = if cfg!(test) {
+        None
+    } else {
+        std::env::var_os(key)
+    };
+    inherited.or_else(|| {
         crate::config::list_synced_env()
             .into_iter()
             .find_map(|(candidate, value)| (candidate == key).then(|| value.into()))
     })
 }
 
-/// Stamp the launching session id and the running orx's bin dir onto a harness
-/// child's env, and write the shell hooks its tool calls source. Call *after*
+/// Stamp the launching session id, this dashboard's data dir and the running orx's
+/// bin dir onto a harness child's env, and write the shell hooks its tool calls source. Call *after*
 /// `prepare_env` so a dashboard-synced value can't shadow either. Harness
 /// children are one-per-session, so this is unambiguous.
 pub fn set_chat_session_env(
@@ -9682,9 +9991,15 @@ pub fn set_chat_session_env(
     session_id: &str,
     harness: &str,
     up_port: Option<u16>,
-) {
+) -> crate::error::Result<()> {
     cmd.env(CHAT_SESSION_ENV, session_id);
     cmd.env(CHAT_HARNESS_ENV, harness);
+    // The agent's `orx` opens the store this dashboard serves, whatever a synced
+    // `ORX_DATA_DIR` or the agent's own home would resolve.
+    let data_dir = crate::commands::remote_host::canonical_data_dir().map_err(|error| {
+        anyhow!("The agent could not be given this dashboard's data directory: {error:#}")
+    })?;
+    cmd.env("ORX_DATA_DIR", data_dir);
     cmd.env(LOCAL_SESSION_ENV, "1");
     cmd.env("ORX_SESSION_ID", session_id);
     cmd.env("ORX_AGENT_TOKEN", delegation::agent_token(session_id));
@@ -9725,13 +10040,13 @@ pub fn set_chat_session_env(
 
     let shell_dir = shell_hook_dir(session_id);
     if std::fs::create_dir_all(&shell_dir).is_err() {
-        return;
+        return Ok(());
     }
     let original_zdotdir = child_env_value("ZDOTDIR")
         .map(PathBuf::from)
-        .or_else(|| child_env_value("HOME").map(PathBuf::from));
+        .or_else(crate::config::home_dir);
     let Some(original_zdotdir) = original_zdotdir else {
-        return;
+        return Ok(());
     };
     let pointer = target_event_pointer(session_id);
     let zshenv = zshenv_hook(&original_zdotdir);
@@ -9745,7 +10060,7 @@ pub fn set_chat_session_env(
         .iter()
         .any(|(name, contents)| std::fs::write(shell_dir.join(name), contents).is_err())
     {
-        return;
+        return Ok(());
     }
 
     let bash_env = shell_dir.join("bash_env");
@@ -9753,12 +10068,13 @@ pub fn set_chat_session_env(
         child_env_value("BASH_ENV").map(|value| value.to_string_lossy().into_owned());
     let bash_hook = bash_env_hook(original_bash_env);
     if std::fs::write(&bash_env, bash_hook).is_err() {
-        return;
+        return Ok(());
     }
 
     cmd.env(CHAT_TARGET_POINTER_ENV, pointer);
     cmd.env("ZDOTDIR", shell_dir);
     cmd.env("BASH_ENV", bash_env);
+    Ok(())
 }
 
 /// The chat session that launched this run, read from the env the harness child
@@ -9869,6 +10185,46 @@ mod session_env_tests {
         assert!(forwarded.invocation_identity().unwrap().is_none());
     }
 
+    /// A data dir saved in the synced env must not split an agent's `orx` from the store
+    /// this dashboard serves.
+    #[test]
+    fn agents_open_the_dashboards_store() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        let synced = crate::config::test_home().join(".openresearch/env");
+        std::fs::create_dir_all(synced.parent().unwrap()).unwrap();
+        std::fs::write(&synced, "export ORX_DATA_DIR='/elsewhere'\n").unwrap();
+        let mut cmd = crate::process::tokio_command("agent");
+        super::prepare_env(&mut cmd);
+        super::set_chat_session_env(&mut cmd, "session", "claude", None).unwrap();
+        let pinned = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "ORX_DATA_DIR")
+            .and_then(|(_, value)| value);
+        let served = crate::commands::remote_host::canonical_data_dir().unwrap();
+        assert_eq!(pinned, Some(served.as_os_str()));
+    }
+
+    /// An agent left on whatever store its environment names could split from the dashboard.
+    #[test]
+    fn an_unusable_data_dir_stops_the_agent_launch() {
+        if !crate::config::in_test_child(&["ORX_DATA_DIR"]) {
+            return;
+        }
+        let file = std::env::temp_dir().join(format!("orx-not-a-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&file, "").unwrap();
+        let data_dir = file.join("data");
+        std::env::set_var("ORX_DATA_DIR", &data_dir);
+        let mut cmd = crate::process::tokio_command("agent");
+        let error = super::set_chat_session_env(&mut cmd, "session", "claude", None).unwrap_err();
+        assert!(
+            error.to_string().contains(&data_dir.display().to_string()),
+            "{error}"
+        );
+    }
+
     #[test]
     fn empty_local_marker_is_not_a_local_session() {
         if !crate::config::in_test_child(&[CHAT_SESSION_ENV, LOCAL_SESSION_ENV]) {
@@ -9941,11 +10297,13 @@ mod cap_tests {
 
     #[cfg(unix)]
     fn write_orx_stub(dir: &std::path::Path, marker: &str) {
-        use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(dir).unwrap();
-        let bin = dir.join("orx");
-        std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s' {marker}\n")).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        orx_test_support::write_executable(
+            dir.join("orx"),
+            format!("#!/bin/sh\nprintf '%s' {marker}\n"),
+            0o755,
+        )
+        .unwrap();
     }
 
     /// A stale `orx` on a directory a user startup file prepends, ahead of the
@@ -10103,6 +10461,7 @@ mod cap_tests {
         let store = Store::open_at(dir.clone()).unwrap();
         store
             .create_chat_session(&StoredChatSession {
+                profile_id: None,
                 id: "session".into(),
                 project_id: "proj_1".into(),
                 harness: "claude-code".into(),
@@ -10209,10 +10568,11 @@ mod cap_tests {
             .unwrap();
 
         // No transcript on disk: the marker-only shape an emptied rollout gives.
-        let session = import_native_chat(&store, "proj_1", "claude-code", "native-1", None);
+        let session = import_native_chat(&store, "proj_1", "claude-code", "native-1", None, None);
         assert!(session.is_err(), "a chat orx cannot read is not adopted");
 
         let adopted = StoredChatSession {
+            profile_id: None,
             id: "chat_1".into(),
             project_id: "proj_1".into(),
             harness: "claude-code".into(),
@@ -10257,7 +10617,8 @@ mod cap_tests {
         assert!(store.native_ids_outside(&[]).unwrap().contains("native-1"));
         // Adopting the same chat again returns the session that already owns
         // it — two sessions driving one native chat would split the history.
-        let again = import_native_chat(&store, "proj_1", "claude-code", "native-1", None).unwrap();
+        let again =
+            import_native_chat(&store, "proj_1", "claude-code", "native-1", None, None).unwrap();
         assert_eq!(again.id, "chat_1");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -10289,6 +10650,7 @@ mod cap_tests {
         let dir = std::env::temp_dir().join(format!("orx-compact-reseed-{}", uuid::Uuid::new_v4()));
         let store = Store::open_at(dir.clone()).unwrap();
         let mut session = StoredChatSession {
+            profile_id: None,
             id: "session".into(),
             project_id: "proj_1".into(),
             harness: "cursor".into(),
@@ -10785,6 +11147,106 @@ mod cap_tests {
 mod bridge_tests {
     use super::*;
 
+    #[test]
+    fn usage_events_only_publish_changes_after_inheriting_the_window() {
+        let mut ctx = TurnCtx::test_stub();
+        let mut events = ctx.host.subscribe();
+        ctx.report_usage(ContextUsage {
+            used_tokens: 42,
+            context_window: Some(100),
+            ..Default::default()
+        });
+        assert_eq!(events.try_recv().unwrap().0, "chat.usage");
+        ctx.report_usage(ContextUsage {
+            used_tokens: 42,
+            context_window: None,
+            ..Default::default()
+        });
+        assert!(events.try_recv().is_err());
+        ctx.report_usage(ContextUsage {
+            used_tokens: 43,
+            context_window: None,
+            ..Default::default()
+        });
+        assert_eq!(events.try_recv().unwrap().1["usage"]["contextWindow"], 100);
+        ctx.report_usage(ContextUsage {
+            used_tokens: 43,
+            context_window: Some(200),
+            ..Default::default()
+        });
+        assert_eq!(events.try_recv().unwrap().1["usage"]["contextWindow"], 200);
+    }
+
+    #[test]
+    fn unchanged_flushes_are_quiet_but_content_and_completion_are_published() {
+        let mut ctx = TurnCtx::test_stub();
+        ctx.session_id = uuid::Uuid::new_v4().to_string();
+        ctx.assistant.id = uuid::Uuid::new_v4().to_string();
+        ctx.assistant.parts = vec![WirePart::text("text", "hello")];
+        let mut events = ctx.host.subscribe();
+        ctx.flush().unwrap();
+        assert_eq!(events.try_recv().unwrap().0, "chat.message");
+        for _ in 0..10 {
+            ctx.flush().unwrap();
+        }
+        assert!(events.try_recv().is_err());
+        ctx.assistant.parts = vec![WirePart::text("text", "hello world")];
+        ctx.flush().unwrap();
+        assert_eq!(
+            events.try_recv().unwrap().1["message"]["parts"][0]["text"],
+            "hello world"
+        );
+        ctx.assistant.completed_at = Some(123);
+        ctx.flush().unwrap();
+        assert_eq!(events.try_recv().unwrap().1["message"]["completedAt"], 123);
+        ctx.native_session_id = Some("native".into());
+        ctx.flush().unwrap();
+        assert_eq!(
+            Store::open()
+                .unwrap()
+                .get_chat_message(&ctx.assistant.id)
+                .unwrap()
+                .unwrap()
+                .result_native_session_id
+                .as_deref(),
+            Some("native")
+        );
+        assert_eq!(events.try_recv().unwrap().0, "chat.message");
+    }
+
+    #[test]
+    fn quiet_flush_preserves_a_concurrently_answered_prompt() {
+        let mut ctx = TurnCtx::test_stub();
+        ctx.session_id = uuid::Uuid::new_v4().to_string();
+        ctx.assistant.id = uuid::Uuid::new_v4().to_string();
+        let mut part = WirePart::text("card", "");
+        part.kind = "prompt".into();
+        part.prompt = Some(WirePrompt {
+            kind: "question".into(),
+            ..Default::default()
+        });
+        ctx.assistant.parts = vec![part];
+        let mut events = ctx.host.subscribe();
+        ctx.flush().unwrap();
+        assert_eq!(events.try_recv().unwrap().0, "chat.message");
+        let mut answer = answer(&["A"], true, None);
+        answer.from = Some("chat_parent".into());
+        mark_prompt_resolved(&ctx.host.msg_write, &ctx.session_id, "card", Some(&answer)).unwrap();
+        ctx.flush().unwrap();
+        assert!(events.try_recv().is_err());
+        assert!(ctx.asking.is_none());
+        let stored = Store::open()
+            .unwrap()
+            .get_chat_message(&ctx.assistant.id)
+            .unwrap()
+            .unwrap();
+        let parts: Vec<WirePart> = serde_json::from_str(&stored.parts_json).unwrap();
+        let prompt = parts[0].prompt.as_ref().unwrap();
+        assert!(prompt.resolved);
+        assert_eq!(prompt.answers, ["A"]);
+        assert_eq!(prompt.answered_by.as_deref(), Some("chat_parent"));
+    }
+
     fn test_host() -> ChatHost {
         ChatHost::new(
             Arc::new(crate::local::opencode::AgentHost::new(None)),
@@ -11177,52 +11639,6 @@ mod bridge_tests {
     }
 
     #[test]
-    fn a_flush_keeps_the_answer_echo_another_path_stamped() {
-        let dir = std::env::temp_dir().join(format!("orx-adopt-{}", uuid::Uuid::new_v4()));
-        let store = Store::open_at(dir.clone()).unwrap();
-        let mut ctx = TurnCtx::test_stub();
-        let card = |prompt: WirePrompt| {
-            let mut part = WirePart::text("card", "");
-            part.kind = "prompt".into();
-            part.prompt = Some(prompt);
-            part
-        };
-        let mut stamped = WirePrompt {
-            kind: "question".into(),
-            ..Default::default()
-        };
-        let mut answer = answer(&["A"], true, None);
-        answer.from = Some("chat_parent".into());
-        stamp_resolved(&mut stamped, Some(&answer));
-        store
-            .upsert_chat_message(&StoredChatMessage {
-                id: ctx.assistant.id.clone(),
-                session_id: ctx.session_id.clone(),
-                role: "assistant".into(),
-                parts_json: serde_json::to_string(&[card(stamped)]).unwrap(),
-                created_at: 1,
-                completed_at: None,
-                parent_id: None,
-                base_native_session_id: None,
-                result_native_session_id: None,
-                result_native_message_id: None,
-                native_harness: None,
-            })
-            .unwrap();
-        ctx.assistant.parts = vec![card(WirePrompt {
-            kind: "question".into(),
-            ..Default::default()
-        })];
-
-        ctx.adopt_resolved_prompts(&store);
-        let adopted = ctx.assistant.parts[0].prompt.as_ref().unwrap();
-        assert!(adopted.resolved);
-        assert_eq!(adopted.answers, ["A"]);
-        assert_eq!(adopted.answered_by.as_deref(), Some("chat_parent"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn stamp_resolved_without_answer_preserves_an_earlier_echo() {
         // A stale-card cleanup (PendingGuard drop, resolve_stale_prompts) runs
         // with no answer; re-resolving must not erase what the user chose.
@@ -11239,6 +11655,7 @@ mod bridge_tests {
 
     fn bare_session() -> StoredChatSession {
         StoredChatSession {
+            profile_id: None,
             id: "chat_1".into(),
             project_id: "proj_1".into(),
             harness: "claude-code".into(),
@@ -11263,6 +11680,214 @@ mod bridge_tests {
             created_at: 1,
             updated_at: 1,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_codex_reads_use_cached_defaults_and_failed_recovery_retries() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        let host = Arc::new(test_host());
+        let store = Store::open().unwrap();
+        let project = TurnCtx::test_stub().project;
+        store.create_local_project(&project).unwrap();
+        let mut session = bare_session();
+        session.project_id = project.id;
+        session.harness = "codex".into();
+        session.title = Some("Test".into());
+        session.model = None;
+        session.native_session_id = Some("legacy-codex".into());
+        store.create_chat_session(&session).unwrap();
+        *host.harnesses.lock().await = Some((
+            std::time::Instant::now(),
+            json!({"harnesses":[{"id":"codex","agentReady":true,"defaultModel":"cached-default"}]}),
+        ));
+        let root = crate::local::native_store::codex_home(
+            crate::local::native_store::NativeStore::Isolated,
+        )
+        .join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("legacy-codex.jsonl");
+        std::fs::write(&path, [0xff]).unwrap();
+        assert_eq!(
+            host.session_json(&session, false).await["model"],
+            "cached-default"
+        );
+        let error = host
+            .send_message(
+                &session.id,
+                "Continue".into(),
+                TurnOverrides::default(),
+                vec![],
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(path.to_str().unwrap()));
+        assert!(store
+            .get_chat_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .model
+            .is_none());
+        assert!(host.harnesses.try_lock().is_ok());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while host.is_busy(&session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed preparation must release its turn reservation");
+        std::fs::write(
+            &path,
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"recovered-model\"}}\n",
+        )
+        .unwrap();
+        host.send_message(
+            &session.id,
+            "Continue".into(),
+            TurnOverrides::default(),
+            vec![],
+            vec![],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let session = store.get_chat_session(&session.id).unwrap().unwrap();
+        assert_eq!(session.model.as_deref(), Some("recovered-model"));
+        std::fs::write(&path, [0xff]).unwrap();
+        assert_eq!(
+            host.session_json(&session, true).await["model"],
+            "recovered-model"
+        );
+        if let Some(TurnState::Active(active)) = host.turns.try_lock().unwrap().remove(&session.id)
+        {
+            active.handle.abort();
+        };
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn saved_opusplan_is_replaced_by_the_resolved_model_before_a_turn() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        let host = Arc::new(test_host());
+        let store = Store::open().unwrap();
+        let project = TurnCtx::test_stub().project;
+        store.create_local_project(&project).unwrap();
+        for configured in ["opusplan", "configured-opus"] {
+            let mut entry = json!({"id":"claude-code","agentReady":true,"models":[
+                {"id":"claude-opus-5-4"},{"id":"claude-opus-5-5"},{"id":"opusplan"}
+            ]});
+            crate::local::harness::resolve_entry(&mut entry, Some(configured)).unwrap();
+            *host.harnesses.lock().await =
+                Some((std::time::Instant::now(), json!({"harnesses":[entry]})));
+            let expected = if configured == "opusplan" {
+                "claude-opus-5-5"
+            } else {
+                configured
+            };
+            let mut session = bare_session();
+            session.id = format!("chat_{configured}");
+            session.project_id = project.id.clone();
+            session.title = Some("Test".into());
+            session.model = Some("opusplan".into());
+            store.create_chat_session(&session).unwrap();
+            host.send_message(
+                &session.id,
+                "Continue".into(),
+                TurnOverrides::default(),
+                vec![],
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let session = store.get_chat_session(&session.id).unwrap().unwrap();
+            assert_eq!(session.model.as_deref(), Some(expected));
+            assert_eq!(host.session_json(&session, true).await["model"], expected);
+            if let Some(TurnState::Active(active)) =
+                host.turns.try_lock().unwrap().remove(&session.id)
+            {
+                active.handle.abort();
+            };
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_model_resolution_ignores_the_previous_agents_saved_acp_state() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        let host = Arc::new(test_host());
+        let store = Store::open().unwrap();
+        let project = TurnCtx::test_stub().project;
+        store.create_local_project(&project).unwrap();
+        let mut session = bare_session();
+        session.project_id = project.id;
+        session.harness = crate::local::acp::presets().remove(0).launch.id;
+        session.title = Some("Test".into());
+        store.create_chat_session(&session).unwrap();
+        store
+            .set_acp_configuration(
+                &session.id,
+                &json!({"models":{"currentModelId":"stale-acp-model"}}),
+            )
+            .unwrap();
+        host.set_agent(
+            &session.id,
+            crate::store::StoredAgentSelection {
+                harness: "claude-code".into(),
+                profile: None,
+                model: None,
+                service_tier: None,
+                permission_mode: None,
+                reasoning_level: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(store
+            .get_chat_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .model
+            .is_none());
+        *host.harnesses.lock().await = Some((
+            std::time::Instant::now(),
+            json!({"harnesses":[{
+                "id":"claude-code", "agentReady":true, "defaultModel":"selected-claude-model", "models":[{"id":"selected-claude-model"}]
+            }]}),
+        ));
+        host.send_message(
+            &session.id,
+            "Continue".into(),
+            TurnOverrides::default(),
+            vec![],
+            vec![],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .get_chat_session(&session.id)
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("selected-claude-model")
+        );
+        if let Some(TurnState::Active(active)) = host.turns.try_lock().unwrap().remove(&session.id)
+        {
+            active.handle.abort();
+        };
     }
 
     #[test]
@@ -11321,6 +11946,7 @@ mod bridge_tests {
                         };
                         store.upsert_chat_message_on_branch(&original).unwrap();
                         let agent = crate::store::StoredAgentSelection {
+                            profile: None,
                             harness: target.into(),
                             model: Some("target-model".into()),
                             service_tier: None,
@@ -11411,6 +12037,7 @@ mod bridge_tests {
                             )
                             .unwrap();
                         let source_agent = crate::store::StoredAgentSelection {
+                            profile: None,
                             harness: source.into(),
                             model: session.model.clone(),
                             service_tier: None,
@@ -11679,6 +12306,7 @@ mod bridge_tests {
                         store.upsert_chat_message_on_branch(&reply).unwrap();
                         let acp = crate::local::acp::presets().remove(0).launch;
                         let agent = crate::store::StoredAgentSelection {
+                            profile: None,
                             harness: if action == "select" {
                                 acp.id
                             } else {
@@ -11765,6 +12393,71 @@ mod bridge_tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[tokio::test]
+    async fn removal_refuses_running_and_leased_side_chats() {
+        let directory =
+            std::env::temp_dir().join(format!("orx-remove-busy-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(directory.clone()).unwrap();
+        let mut session = bare_session();
+        session.harness = "cursor".into();
+        session.side_parent_session_id = Some("parent".into());
+        store.create_chat_session(&session).unwrap();
+        assert!(store.list_all_chat_sessions().unwrap().is_empty());
+        let host = test_host();
+        let removal = || std::future::ready(Err(anyhow!("Removal must not run during a turn")));
+        host.turns
+            .lock()
+            .await
+            .insert(session.id.clone(), TurnState::Reserved { turn_id: None });
+        assert!(!host
+            .remove_harness_install(store, "cursor", removal())
+            .await
+            .unwrap());
+        host.turns.lock().await.clear();
+        let store = Store::open_at(directory.clone()).unwrap();
+        assert!(store
+            .claim_chat_turn(&session.id, "another-dashboard", &[])
+            .unwrap());
+        assert!(!host
+            .remove_harness_install(store, "cursor", removal())
+            .await
+            .unwrap());
+        let store = Store::open_at(directory.clone()).unwrap();
+        let preset = crate::local::acp::presets()
+            .into_iter()
+            .find(|preset| preset.launch.executable == "dsh")
+            .unwrap();
+        session.id = "acp-side-chat".into();
+        session.harness = preset.launch.id;
+        store.create_chat_session(&session).unwrap();
+        assert_eq!(
+            store.chat_session_ids_for_agent("dsh", "dsh").unwrap(),
+            [session.id.clone()]
+        );
+        host.turns
+            .lock()
+            .await
+            .insert(session.id.clone(), TurnState::Reserved { turn_id: None });
+        assert!(!host
+            .remove_harness_install(store, "dsh", removal())
+            .await
+            .unwrap());
+        let store = Store::open_at(directory.clone()).unwrap();
+        let tx = store.begin().unwrap();
+        tx.execute(
+            "UPDATE chat_sessions SET harness = 'cursor' WHERE id = ?1",
+            [&session.id],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(store
+            .chat_session_ids_for_agent("dsh", "dsh")
+            .unwrap()
+            .is_empty());
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -11969,6 +12662,29 @@ mod bridge_tests {
     }
 
     #[test]
+    fn session_json_names_the_models_an_acp_chat_offers() {
+        let store = Store::open().unwrap();
+        let mut session = bare_session();
+        session.id = format!("chat_{}", uuid::Uuid::new_v4());
+        session.harness = crate::local::acp::presets().remove(0).launch.id;
+        store.create_chat_session(&session).unwrap();
+        let options = json!({"configOptions":[{"id":"model", "type":"select", "category":"model", "currentValue":"a", "options":[{"value":"a", "name":"GPT-6.1-Sol"}]}]});
+        store.set_acp_configuration(&session.id, &options).unwrap();
+        let wire = session_json_with(Some(&store), &session, false);
+        assert_eq!(wire["nativeModels"][0]["id"], "a");
+        assert_eq!(wire["nativeModels"][0]["parsed"]["key"], "gpt sol@6.1");
+
+        store
+            .set_acp_configuration(&session.id, &json!({"configOptions": []}))
+            .unwrap();
+        let wire = session_json_with(Some(&store), &session, false);
+        assert!(
+            wire["nativeModels"].is_null(),
+            "the agent's catalog stands in"
+        );
+    }
+
+    #[test]
     fn session_json_carries_title_source() {
         // The UI keys its title-reveal animation off this field, so it has to
         // survive to the wire — null on a legacy row, verbatim otherwise.
@@ -12068,6 +12784,7 @@ mod bridge_tests {
         let usage = ContextUsage {
             used_tokens: 100,
             context_window: None,
+            ..Default::default()
         };
         // Only usedTokens survives; the None window is skipped.
         assert_eq!(
@@ -12089,6 +12806,7 @@ mod run_wakeup_tests {
     fn session_on(store: &Store, id: &str, harness: &str) {
         store
             .create_chat_session(&StoredChatSession {
+                profile_id: None,
                 id: id.into(),
                 project_id: "p1".into(),
                 harness: harness.into(),
@@ -12161,8 +12879,11 @@ mod run_wakeup_tests {
             unknown: Default::default(),
         };
         let tx = store.begin().unwrap();
-        tx.execute("UPDATE chat_sessions SET harness = ?1", [&launch.id])
-            .unwrap();
+        tx.execute(
+            "UPDATE chat_sessions SET harness = ?1, model = 'fixture-model'",
+            [&launch.id],
+        )
+        .unwrap();
         tx.execute(
             "INSERT OR IGNORE INTO acp_sessions (session_id, launch_json, configuration_json)
              SELECT id, ?1, '[]' FROM chat_sessions",
@@ -13343,8 +14064,6 @@ for line in sys.stdin:
     #[cfg(unix)]
     #[test]
     fn claude_fork_switches_branch_the_native_session() {
-        use std::os::unix::fs::PermissionsExt;
-
         async fn finished(
             chat: &ChatHost,
             events: &mut broadcast::Receiver<(&'static str, Value)>,
@@ -13391,7 +14110,7 @@ for line in sys.stdin:
             let args = root.join("claude-args");
             let prompts = root.join("claude-prompts");
             std::fs::create_dir_all(&bin).unwrap();
-            std::fs::write(
+            orx_test_support::write_executable(
                 bin.join("claude"),
                 format!(
                     r#"#!/bin/sh
@@ -13426,10 +14145,9 @@ done
                     args = args.display(),
                     prompts = prompts.display()
                 ),
+                0o755,
             )
             .unwrap();
-            std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
             let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
                 &std::env::var_os("PATH").unwrap_or_default(),
             )))
@@ -13605,6 +14323,7 @@ done
 
             // Coming back from another agent branches where Claude last ended.
             let agent = |harness: &str| crate::store::StoredAgentSelection {
+                profile: None,
                 harness: harness.into(),
                 model: None,
                 service_tier: None,
@@ -13720,6 +14439,142 @@ done
                 assert_eq!(stored.recovery_action.as_deref(), Some("continue"));
                 assert!(!host.is_busy(&session_id).await);
             }
+        });
+    }
+
+    #[test]
+    fn stop_for_shutdown_stops_active_and_retrying_turns_while_preserving_continue_recovery() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let store = Store::open().unwrap();
+            let host = Arc::new(ChatHost::new(
+                Arc::new(crate::local::opencode::AgentHost::new(None)),
+                Arc::new(crate::local::codex::CodexHost::new()),
+                Arc::new(crate::local::claude::ClaudeHost::new()),
+            ));
+            let session_id = "retrying-chat";
+            session(&store, session_id);
+            assert!(host.claim_durable_turn(session_id));
+            let turn = crate::store::StoredChatTurn {
+                id: "turn-retrying".into(),
+                session_id: session_id.into(),
+                user_message_id: None,
+                assistant_message_id: "answer-retrying".into(),
+                client_turn_id: "client-retrying".into(),
+                request_hash: "task".into(),
+                prepared_input: "task".into(),
+                settings_json: "{}".into(),
+                state: "retrying".into(),
+                delivery_state: "accepted".into(),
+                attempt_count: 2,
+                next_retry_at: Some(now_ms() + 42_354_000),
+                error_kind: None,
+                error_message: None,
+                recovery_action: None,
+                recovered_by_turn_id: None,
+                created_at: now_ms(),
+                updated_at: now_ms(),
+            };
+            store.admit_chat_turn(None, &turn).unwrap();
+            store
+                .upsert_chat_message(&StoredChatMessage {
+                    id: turn.assistant_message_id.clone(),
+                    session_id: session_id.into(),
+                    role: "assistant".into(),
+                    parts_json: serde_json::to_string(&vec![
+                        WirePart::text("text-1", "Partial answer."),
+                        WirePart::tool("turn-retry", "retry", "running", None),
+                    ])
+                    .unwrap(),
+                    created_at: now_ms(),
+                    completed_at: None,
+                    parent_id: None,
+                    base_native_session_id: None,
+                    result_native_session_id: None,
+                    result_native_message_id: None,
+                    native_harness: None,
+                })
+                .unwrap();
+            host.turns.lock().await.insert(
+                session_id.into(),
+                TurnState::Active(ActiveTurn {
+                    handle: tokio::spawn(std::future::pending()),
+                    message_id: turn.assistant_message_id.clone(),
+                    turn_id: turn.id.clone(),
+                }),
+            );
+
+            host.stop_admitting();
+            host.stop_for_shutdown().await;
+            host.release_turn_leases();
+
+            assert!(!host.is_busy(session_id).await);
+            assert!(!store.chat_turn_leased(session_id).unwrap());
+
+            reconcile_unfinished_turns(&store).unwrap();
+            let stored = store.get_chat_turn(session_id, &turn.id).unwrap().unwrap();
+            assert_eq!(stored.state, "failed");
+            assert_eq!(stored.recovery_action.as_deref(), Some("continue"));
+            let message = store
+                .get_chat_message(&turn.assistant_message_id)
+                .unwrap()
+                .unwrap();
+            let wire = stored_to_wire(&message);
+            assert!(!wire.parts.iter().any(|part| part.id == "turn-retry"));
+            assert!(wire.parts.iter().any(|part| part.id == "turn-recovery"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_stops_leave_the_agent_to_host_shutdown_but_lost_leases_interrupt_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let aborts = Arc::new(AtomicUsize::new(0));
+            let counted = aborts.clone();
+            let app = axum::Router::new().route(
+                "/session/native/abort",
+                axum::routing::post(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    async { axum::Json(json!(true)) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let fixture = crate::local::git::TemporaryDirectory::new("orx-shutdown-stop").unwrap();
+            let opencode = crate::local::opencode::AgentHost::new(None);
+            opencode.serve_for_test("chat", port, fixture.path()).await;
+            let host = Arc::new(ChatHost::new(
+                Arc::new(opencode),
+                Arc::new(crate::local::codex::CodexHost::new()),
+                Arc::new(crate::local::claude::ClaudeHost::new()),
+            ));
+            let store = Store::open().unwrap();
+            session_on(&store, "chat", "opencode");
+            store
+                .set_chat_session_native_id("chat", Some("native"))
+                .unwrap();
+
+            for (mode, expected) in [(StopMode::Shutdown, 0), (StopMode::LeaseLost, 1)] {
+                host.turns.lock().await.insert(
+                    "chat".into(),
+                    TurnState::Active(ActiveTurn {
+                        handle: tokio::spawn(std::future::pending()),
+                        message_id: "answer".into(),
+                        turn_id: "turn".into(),
+                    }),
+                );
+                assert!(host.stop_turn("chat", mode).await.unwrap());
+                assert_eq!(aborts.load(Ordering::SeqCst), expected);
+            }
+            server.abort();
         });
     }
 
@@ -13922,6 +14777,7 @@ mod transcript_tree_tests {
 
     fn parent_session(harness: &str) -> StoredChatSession {
         StoredChatSession {
+            profile_id: None,
             id: "chat_parent".into(),
             project_id: "proj_1".into(),
             harness: harness.into(),
@@ -14172,6 +15028,7 @@ mod steering_tests {
     fn add_test_session(store: &Store) {
         store
             .create_chat_session(&StoredChatSession {
+                profile_id: None,
                 id: "owner".into(),
                 project_id: "p1".into(),
                 harness: "codex".into(),

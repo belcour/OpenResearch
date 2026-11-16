@@ -32,8 +32,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::Deserialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
@@ -59,6 +59,9 @@ use crate::local::codex::{CodexClient, JsonRpcError, ServerReqKind, TurnEvent};
 use crate::local::native_store::{self, NativeStore};
 use crate::local::opencode::ensure_playbook;
 use crate::local::shell_env::installs;
+use crate::local::usage::{
+    remaining_percent, PlanCredits, PlanResets, PlanWindow, Read, ResetCredit, Snapshot, Unanswered,
+};
 use crate::store::{Store, StoredChatMessage};
 
 fn codex_native_usage(usage: &Value) -> crate::store::TokenUsage {
@@ -342,13 +345,26 @@ const CODEX_REASONING_LEVELS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 /// Query the app-server's `model/list` — codex's own catalog, the same data its
 /// TUI picker renders: every model with its `supportedReasoningEfforts` and
 /// default. The installed CLI owns its catalog and per-model effort choices.
-///
-/// Protocol: spawn `codex app-server`, `initialize` → `initialized` (the same
-/// handshake `local::codex` uses, incl. `experimentalApi` — `model/list` is
-/// part of the v2 surface), then one `model/list` request. Any failure returns
-/// `None`. Hidden catalog entries are skipped
-/// (the server already filters them by default; the guard is belt-and-braces).
-async fn codex_model_list(bin: &Path, configured_effort: Option<&str>) -> Option<Vec<ModelInfo>> {
+/// Any failure returns `None`. Hidden catalog entries are skipped (the server
+/// already filters them by default; the guard is belt-and-braces).
+async fn codex_model_list(bin: &Path, home: Option<&Path>) -> Option<Value> {
+    codex_rpc(bin, home, "model/list", json!({}))
+        .await
+        .ok()?
+        .get("result")
+        .cloned()
+}
+
+/// One request on a throwaway `codex app-server`: `initialize` →
+/// `initialized` (the handshake `local::codex` uses, incl. `experimentalApi`,
+/// which the v2 surface needs), the request, then its whole response, a
+/// JSON-RPC error included.
+async fn codex_rpc(
+    bin: &Path,
+    home: Option<&Path>,
+    method: &str,
+    params: Value,
+) -> std::result::Result<Value, Unanswered> {
     // Acquire the spawn lane before the deadline — queue time must not spend
     // the child's execution budget.
     let permit = super::detect::detect_spawn_permit().await;
@@ -360,29 +376,40 @@ async fn codex_model_list(bin: &Path, configured_effort: Option<&str>) -> Option
             .stderr(Stdio::null())
             .kill_on_drop(true);
         prepare_env(&mut cmd);
-        let (mut child, _permit) = super::detect::spawn_with_permit(cmd, permit).await.ok()?;
-        let mut stdin = child.stdin.take()?;
-        let mut lines = BufReader::new(child.stdout.take()?).lines();
+        if let Some(home) = home {
+            cmd.env("CODEX_HOME", home);
+        }
+        let (mut child, _permit) = super::detect::spawn_with_permit(cmd, permit)
+            .await
+            .map_err(Unanswered::Spawn)?;
+        let mut stdin = child.stdin.take().ok_or(Unanswered::Closed)?;
+        let mut lines = BufReader::new(child.stdout.take().ok_or(Unanswered::Closed)?).lines();
 
         use tokio::io::AsyncWriteExt;
-        async fn send(stdin: &mut tokio::process::ChildStdin, v: Value) -> Option<()> {
+        async fn send(
+            stdin: &mut tokio::process::ChildStdin,
+            v: Value,
+        ) -> std::result::Result<(), Unanswered> {
             let mut line = v.to_string();
             line.push('\n');
-            stdin.write_all(line.as_bytes()).await.ok()
+            stdin
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|_| Unanswered::Closed)
         }
         // Read until the response with this id (skipping notifications).
         async fn recv(
             lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
             id: u64,
-        ) -> Option<Value> {
+        ) -> std::result::Result<Value, Unanswered> {
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Ok(v) = serde_json::from_str::<Value>(&line) {
                     if v.get("id").and_then(Value::as_u64) == Some(id) {
-                        return Some(v);
+                        return Ok(v);
                     }
                 }
             }
-            None
+            Err(Unanswered::Closed)
         }
 
         send(
@@ -405,17 +432,548 @@ async fn codex_model_list(bin: &Path, configured_effort: Option<&str>) -> Option
         send(&mut stdin, serde_json::json!({ "method": "initialized" })).await?;
         send(
             &mut stdin,
-            serde_json::json!({ "id": 2, "method": "model/list", "params": {} }),
+            serde_json::json!({ "id": 2, "method": method, "params": params }),
         )
         .await?;
-        let resp = recv(&mut lines, 2).await?;
-        let models = parse_model_list(resp.get("result")?, configured_effort);
-        (!models.is_empty()).then_some(models)
+        recv(&mut lines, 2).await
     };
     tokio::time::timeout(Duration::from_secs(15), fut)
         .await
-        .ok()
-        .flatten()
+        .unwrap_or(Err(Unanswered::TimedOut))
+}
+
+const RATE_LIMITS: &str = "account/rateLimits/read";
+
+/// Why an account request got no result.
+#[derive(Debug, PartialEq)]
+pub(crate) enum AccountError {
+    /// The installed Codex predates the method.
+    Unsupported,
+    /// Codex answered with an error, whose message this is.
+    Rejected(String),
+    /// Codex gave no answer; the message says why.
+    Unanswered(String),
+}
+
+/// One request about `profile`'s account, asked of a chat's live app-server
+/// signed in to it when there is one, since two processes refreshing the same
+/// single-use ChatGPT token can sign the user out; else of a throwaway one.
+async fn account_request(
+    codex: &crate::local::codex::CodexHost,
+    profile: Option<&str>,
+    bin: &Path,
+    home: Option<&Path>,
+    method: &str,
+    params: Value,
+) -> std::result::Result<Value, AccountError> {
+    if let Some(client) = codex.live_client(profile).await {
+        return match client
+            .try_request_with_timeout(method, params, Duration::from_secs(15))
+            .await
+        {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => Err(rpc_error(Some(error.code), &error.message)),
+            Err(error) => Err(AccountError::Unanswered(format!(
+                "Codex didn't answer: {error}."
+            ))),
+        };
+    }
+    match codex_rpc(bin, home, method, params).await {
+        Ok(response) => response_result(&response),
+        Err(unanswered) => Err(AccountError::Unanswered(unanswered.message("Codex", bin))),
+    }
+}
+
+fn response_result(response: &Value) -> std::result::Result<Value, AccountError> {
+    match response.get("error") {
+        Some(error) => Err(rpc_error(
+            error.get("code").and_then(Value::as_i64),
+            error.get("message").and_then(Value::as_str).unwrap_or(""),
+        )),
+        None => Ok(response.get("result").cloned().unwrap_or(Value::Null)),
+    }
+}
+
+fn rpc_error(code: Option<i64>, message: &str) -> AccountError {
+    // Releases that predate a method reject it as an unknown variant of the
+    // request enum rather than with method-not-found.
+    if code == Some(-32601) || (code == Some(-32600) && message.contains("unknown variant")) {
+        AccountError::Unsupported
+    } else {
+        AccountError::Rejected(message.to_string())
+    }
+}
+
+/// The account's plan limits and resets from `account/rateLimits/read`.
+pub(crate) async fn read_plan(
+    codex: &crate::local::codex::CodexHost,
+    profile: Option<&str>,
+    bin: &Path,
+    home: Option<&Path>,
+) -> Read {
+    plan_read(account_request(codex, profile, bin, home, RATE_LIMITS, Value::Null).await)
+}
+
+fn plan_read(answer: std::result::Result<Value, AccountError>) -> Read {
+    match answer {
+        Ok(result) => parse_plan(&result),
+        Err(AccountError::Unsupported) => Read::Unsupported,
+        Err(AccountError::Rejected(message)) => {
+            Read::Failed(format!("Codex couldn't read this plan's limits: {message}"))
+        }
+        Err(AccountError::Unanswered(message)) => Read::Failed(message),
+    }
+}
+
+/// What `account/rateLimitResetCredit/consume` did.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ResetOutcome {
+    Reset,
+    /// No current window is eligible; the credit is kept.
+    NothingToReset,
+    NoCredit,
+    /// This attempt already reset the limits.
+    AlreadyRedeemed,
+}
+
+/// Spends one of the account's resets. `attempt` is the idempotency key of one
+/// confirmed click, so a retry of it never spends a second credit; without
+/// `credit`, Codex picks the next one.
+pub(crate) async fn consume_reset(
+    codex: &crate::local::codex::CodexHost,
+    profile: Option<&str>,
+    bin: &Path,
+    home: Option<&Path>,
+    credit: Option<&str>,
+    attempt: &str,
+) -> std::result::Result<ResetOutcome, AccountError> {
+    let params = json!({ "idempotencyKey": attempt, "creditId": credit });
+    let result = account_request(
+        codex,
+        profile,
+        bin,
+        home,
+        "account/rateLimitResetCredit/consume",
+        params,
+    )
+    .await?;
+    let outcome = result.get("outcome").and_then(Value::as_str);
+    match outcome {
+        Some("reset") => Ok(ResetOutcome::Reset),
+        Some("nothingToReset") => Ok(ResetOutcome::NothingToReset),
+        Some("noCredit") => Ok(ResetOutcome::NoCredit),
+        Some("alreadyRedeemed") => Ok(ResetOutcome::AlreadyRedeemed),
+        _ => Err(AccountError::Rejected(format!(
+            "it answered {result}, which this version of OpenResearch can't read"
+        ))),
+    }
+}
+
+/// `account/rateLimits/read`'s result, as far as the plan needs it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RateLimits {
+    rate_limits: RateLimitBucket,
+    rate_limits_by_limit_id: Option<std::collections::BTreeMap<String, RateLimitBucket>>,
+    /// Its list may be capped below the count, and lists spent and expired credits too.
+    rate_limit_reset_credits: Option<ResetCredits>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RateLimitBucket {
+    limit_id: Option<String>,
+    limit_name: Option<String>,
+    primary: Option<RateLimitWindow>,
+    secondary: Option<RateLimitWindow>,
+    credits: Option<Credits>,
+    plan_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RateLimitWindow {
+    used_percent: f64,
+    window_duration_mins: Option<u64>,
+    /// Unix seconds.
+    resets_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Credits {
+    has_credits: Option<bool>,
+    unlimited: Option<bool>,
+    balance: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetCredits {
+    available_count: i64,
+    credits: Option<Vec<ResetCreditEntry>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetCreditEntry {
+    id: String,
+    status: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    /// Unix seconds.
+    expires_at: Option<i64>,
+}
+
+/// Codex's main bucket gives the plan-wide windows; any other bucket in
+/// `rateLimitsByLimitId` is a model's own, named by its `limitName`.
+fn parse_plan(result: &Value) -> Read {
+    let Ok(limits) = RateLimits::deserialize(result) else {
+        return Read::Failed("Codex reported usage in a form orx can't read yet.".into());
+    };
+    let main = limits.rate_limits;
+    let rfc3339 = |seconds: i64| crate::telemetry::iso8601_utc(seconds * 1000);
+
+    let others = limits.rate_limits_by_limit_id.unwrap_or_default();
+    let models = others
+        .iter()
+        .filter(|(id, _)| Some(*id) != main.limit_id.as_ref())
+        .map(|(id, bucket)| (Some(bucket.limit_name.as_deref().unwrap_or(id)), bucket));
+    let windows = std::iter::once((None, &main))
+        .chain(models)
+        .flat_map(|(model, bucket)| {
+            let windows = [&bucket.primary, &bucket.secondary].into_iter().flatten();
+            windows.map(move |window| PlanWindow {
+                minutes: window.window_duration_mins,
+                model: model.map(str::to_string),
+                remaining_percent: remaining_percent(window.used_percent),
+                resets_at: window.resets_at.map(rfc3339),
+            })
+        })
+        .collect();
+
+    let resets = limits
+        .rate_limit_reset_credits
+        .filter(|resets| resets.available_count > 0);
+    let resets = resets.map(|resets| PlanResets {
+        available: resets.available_count as u64,
+        credits: resets.credits.map(|credits| {
+            credits
+                .into_iter()
+                .filter(|credit| credit.status.as_deref() == Some("available"))
+                .map(|credit| ResetCredit {
+                    id: credit.id,
+                    title: credit.title,
+                    description: credit.description,
+                    expires_at: credit.expires_at.map(rfc3339),
+                })
+                .collect()
+        }),
+    });
+    let credits = main
+        .credits
+        .filter(|credits| credits.has_credits == Some(true) || credits.unlimited == Some(true));
+    Read::Plan(Snapshot {
+        plan: main.plan_type.as_deref().map(codex_plan_label),
+        windows,
+        credits: credits.map(|credits| PlanCredits {
+            balance: credits.balance,
+            unlimited: credits.unlimited == Some(true),
+        }),
+        extra_usage: None,
+        resets,
+    })
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn plan_from_response(response: &Value) -> Read {
+        plan_read(response_result(response))
+    }
+
+    /// Live from Codex 0.166 on a ChatGPT Pro plan.
+    fn pro() -> Value {
+        json!({"id": 2, "result": {"ordinaryUsageAllowed": true, "rateLimits": {"limitId": "codex",
+            "limitName": null, "normalModelSlug": null, "primary": {"usedPercent": 2,
+            "windowDurationMins": 10080, "resetsAt": 1795202690}, "secondary": null,
+            "credits": {"hasCredits": false, "unlimited": false, "balance": "0"},
+            "individualLimit": null, "spendControlReached": false, "planType": "pro",
+            "rateLimitReachedType": null}, "rateLimitsByLimitId": {"codex": {"limitId": "codex",
+            "limitName": null, "primary": {"usedPercent": 2, "windowDurationMins": 10080,
+            "resetsAt": 1795202690}, "secondary": null, "planType": "pro"}},
+            "rateLimitResetCredits": {"availableCount": 1, "credits": []},
+            "rateLimitUpsell": null}})
+    }
+
+    #[test]
+    fn a_subscription_reads_as_what_is_left_of_each_window() {
+        let Read::Plan(snapshot) = plan_from_response(&pro()) else {
+            panic!("{:?}", plan_from_response(&pro()));
+        };
+        assert_eq!(snapshot.plan.as_deref(), Some("Pro 200"));
+        assert_eq!(
+            snapshot.windows,
+            [PlanWindow {
+                minutes: Some(10080),
+                model: None,
+                remaining_percent: 98.0,
+                resets_at: Some("2026-11-20T19:24:50.000Z".into()),
+            }]
+        );
+        assert_eq!(snapshot.credits, None, "a zero balance is no credits");
+
+        let mut response = pro();
+        let result = &mut response["result"];
+        result["rateLimits"]["secondary"] =
+            json!({"usedPercent": 140.5, "windowDurationMins": 300, "resetsAt": null});
+        result["rateLimits"]["credits"] =
+            json!({"hasCredits": true, "unlimited": false, "balance": "12.50"});
+        result["rateLimitsByLimitId"]["codex_spark"] = json!({"limitId": "codex_spark",
+            "limitName": "GPT-5.3-Codex-Spark", "primary": {"usedPercent": 30,
+            "windowDurationMins": 10080, "resetsAt": 1795202690}, "secondary": null});
+        let Read::Plan(snapshot) = plan_from_response(&response) else {
+            panic!()
+        };
+        let summary = snapshot
+            .windows
+            .iter()
+            .map(|w| (w.minutes, w.model.as_deref(), w.remaining_percent))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                (Some(10080), None, 98.0),
+                (Some(300), None, 0.0),
+                (Some(10080), Some("GPT-5.3-Codex-Spark"), 70.0),
+            ]
+        );
+        assert_eq!(
+            snapshot.credits,
+            Some(PlanCredits {
+                balance: Some("12.50".into()),
+                unlimited: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_codex_too_old_for_the_method_is_unsupported() {
+        // Live from 0.166: an unknown method is an unknown variant of the request enum.
+        let unknown = json!({"id": 2, "error": {"code": -32600,
+            "message": "Invalid request: unknown variant `account/rateLimits/read`, expected one of `initialize`"}});
+        assert_eq!(plan_from_response(&unknown), Read::Unsupported);
+        let not_found = json!({"id": 2, "error": {"code": -32601, "message": "Method not found"}});
+        assert_eq!(plan_from_response(&not_found), Read::Unsupported);
+        let failed = json!({"id": 2, "error": {"code": -32603, "message": "backend unavailable"}});
+        assert!(
+            matches!(plan_from_response(&failed), Read::Failed(message) if message.contains("backend unavailable"))
+        );
+    }
+
+    #[test]
+    fn a_shape_it_cannot_read_fails_rather_than_guessing() {
+        for result in [
+            json!({}),
+            json!({"rateLimits": null}),
+            json!({"rateLimits": {"primary": {"usedPercent": "2%"}}}),
+            json!({"rateLimits": {"primary": {"usedPercent": 2, "resetsAt": "soon"}}}),
+            json!({"rateLimits": {"primary": 2}}),
+            json!({"rateLimits": {}, "rateLimitsByLimitId": []}),
+        ] {
+            let response = json!({"id": 2, "result": result});
+            assert!(
+                matches!(plan_from_response(&response), Read::Failed(_)),
+                "{result}"
+            );
+        }
+    }
+
+    fn resets(credits: Value) -> Read {
+        let mut response = pro();
+        response["result"]["rateLimitResetCredits"] = credits;
+        plan_from_response(&response)
+    }
+
+    fn snapshot_resets(read: Read) -> Option<PlanResets> {
+        let Read::Plan(snapshot) = read else {
+            panic!("{read:?}");
+        };
+        snapshot.resets
+    }
+
+    #[test]
+    fn resets_read_as_what_is_available() {
+        // Live from Codex 0.169 on a ChatGPT Pro plan.
+        let full = json!({"id": "RateLimitResetCredit_20fc", "resetType": "codexRateLimits",
+            "status": "available", "grantedAt": 1794522991, "expiresAt": 1797114991,
+            "title": "Full reset",
+            "description": "Thanks for using Codex! You've been granted one free rate limit reset."});
+        assert_eq!(
+            snapshot_resets(resets(
+                json!({"availableCount": 1, "credits": [full.clone()]})
+            )),
+            Some(PlanResets {
+                available: 1,
+                credits: Some(vec![ResetCredit {
+                    id: "RateLimitResetCredit_20fc".into(),
+                    title: Some("Full reset".into()),
+                    description: Some(
+                        "Thanks for using Codex! You've been granted one free rate limit reset."
+                            .into()
+                    ),
+                    expires_at: Some("2026-12-12T22:36:31.000Z".into()),
+                }]),
+            })
+        );
+
+        let count_only = resets(json!({"availableCount": 2, "credits": null}));
+        assert_eq!(
+            snapshot_resets(count_only),
+            Some(PlanResets {
+                available: 2,
+                credits: None
+            })
+        );
+
+        // A list capped below the count, with spent credits beside the available one.
+        let mut redeemed = full.clone();
+        redeemed["id"] = json!("spent");
+        redeemed["status"] = json!("redeemed");
+        let mut bare = full.clone();
+        bare["id"] = json!("bare");
+        bare["title"] = Value::Null;
+        bare["description"] = Value::Null;
+        bare["expiresAt"] = Value::Null;
+        let capped = snapshot_resets(resets(
+            json!({"availableCount": 3, "credits": [redeemed, bare]}),
+        ))
+        .unwrap();
+        assert_eq!(capped.available, 3);
+        assert_eq!(
+            capped.credits,
+            Some(vec![ResetCredit {
+                id: "bare".into(),
+                title: None,
+                description: None,
+                expires_at: None,
+            }])
+        );
+
+        for none in [Value::Null, json!({"availableCount": 0, "credits": []})] {
+            assert_eq!(snapshot_resets(resets(none.clone())), None, "{none}");
+        }
+        let mut response = pro();
+        response["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rateLimitResetCredits");
+        assert_eq!(
+            snapshot_resets(plan_from_response(&response)),
+            None,
+            "an older Codex"
+        );
+
+        for unreadable in [
+            json!({"availableCount": "1"}),
+            json!({"availableCount": 1, "credits": {}}),
+            json!({"availableCount": 1, "credits": [{"status": "available"}]}),
+            json!({"availableCount": 1, "credits": [{"id": "x", "status": "available", "expiresAt": "soon"}]}),
+        ] {
+            assert!(
+                matches!(resets(unreadable.clone()), Read::Failed(_)),
+                "{unreadable}"
+            );
+        }
+    }
+
+    /// A throwaway app-server that records its `method` request in `request`
+    /// and answers it with `answer`.
+    #[cfg(unix)]
+    fn fake_app_server(dir: &Path, method: &str, answer: &Value) -> std::path::PathBuf {
+        let bin = dir.join("codex");
+        let request = dir.join("request");
+        let script = format!(
+            "#!/bin/sh\nwhile read line; do\n  case \"$line\" in\n    *'\"id\":1,'*) echo '{{\"id\":1,\"result\":{{}}}}' ;;\n    *'{method}'*) printf '%s\\n' \"$line\" > '{}'; echo '{answer}' ;;\n  esac\ndone\n",
+            request.display()
+        );
+        orx_test_support::write_executable(&bin, script, 0o755).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reset_passes_its_attempt_through_and_reads_each_outcome() {
+        const CONSUME: &str = "account/rateLimitResetCredit/consume";
+        let dir = crate::local::git::TemporaryDirectory::new("orx-codex-reset").unwrap();
+        let codex = crate::local::codex::CodexHost::new();
+        let outcome = |outcome: &str| json!({"id": 2, "result": {"outcome": outcome}});
+        let error = |code: i64, message: &str| json!({"id": 2, "error": {"code": code, "message": message}});
+        let too_old = "Invalid request: unknown variant `account/rateLimitResetCredit/consume`";
+        // Without a credit, Codex picks the next.
+        for (credit, answer, expected) in [
+            (Some("credit-1"), outcome("reset"), Ok(ResetOutcome::Reset)),
+            (
+                None,
+                outcome("nothingToReset"),
+                Ok(ResetOutcome::NothingToReset),
+            ),
+            (None, outcome("noCredit"), Ok(ResetOutcome::NoCredit)),
+            (
+                None,
+                outcome("alreadyRedeemed"),
+                Ok(ResetOutcome::AlreadyRedeemed),
+            ),
+            (None, error(-32600, too_old), Err(AccountError::Unsupported)),
+            (
+                None,
+                error(-32603, "backend unavailable"),
+                Err(AccountError::Rejected("backend unavailable".into())),
+            ),
+        ] {
+            let bin = fake_app_server(dir.path(), CONSUME, &answer);
+            let consumed = consume_reset(&codex, None, &bin, None, credit, "attempt-7").await;
+            assert_eq!(consumed, expected, "{answer}");
+            let request = std::fs::read_to_string(dir.path().join("request")).unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(
+                request["params"],
+                json!({"idempotencyKey": "attempt-7", "creditId": credit})
+            );
+        }
+
+        let bin = fake_app_server(dir.path(), CONSUME, &outcome("partial"));
+        assert!(
+            matches!(
+                consume_reset(&codex, None, &bin, None, None, "a").await,
+                Err(AccountError::Rejected(message)) if message.contains("partial")
+            ),
+            "an outcome orx can't read is never taken for one it can"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_read_runs_on_a_throwaway_app_server() {
+        let dir = crate::local::git::TemporaryDirectory::new("orx-codex-usage").unwrap();
+        let bin = fake_app_server(dir.path(), RATE_LIMITS, &pro());
+        let codex = crate::local::codex::CodexHost::new();
+        assert!(matches!(
+            read_plan(&codex, None, &bin, None).await,
+            Read::Plan(_)
+        ));
+
+        let missing = dir.path().join("gone");
+        let Read::Failed(message) = read_plan(&codex, None, &missing, None).await else {
+            panic!("a missing binary is a failed read");
+        };
+        assert!(
+            message.contains(&missing.display().to_string()),
+            "{message}"
+        );
+    }
 }
 
 /// `model/list` result → per-model `ModelInfo`, efforts attached in catalog
@@ -491,6 +1049,10 @@ pub struct Codex;
 /// Only the fields detection needs off `config.toml`; codex has many more.
 #[derive(Deserialize)]
 struct CodexConfig {
+    model: Option<String>,
+    profile: Option<String>,
+    #[serde(default)]
+    profiles: HashMap<String, CodexProfile>,
     model_provider: Option<String>,
     /// The user's configured effort override. Codex resolves it above the
     /// catalog's per-model `defaultReasoningEffort`, so the picker's
@@ -506,7 +1068,52 @@ struct CodexConfig {
     model_providers: HashMap<String, CodexProvider>,
 }
 
-/// The `model_reasoning_effort` the user configured in `config.toml`, if any.
+#[derive(Deserialize)]
+struct CodexProfile {
+    model: Option<String>,
+}
+
+#[test]
+fn configured_model_precedes_catalog_recommendation() {
+    let catalog = serde_json::json!({"data":[{"model":"gpt-5.10-sol","isDefault":true}]});
+    assert_eq!(
+        codex_default_model(Some("model = 'custom'"), Some(&catalog)).as_deref(),
+        Some("custom")
+    );
+    assert_eq!(
+        codex_default_model(None, Some(&catalog)).as_deref(),
+        Some("gpt-5.10-sol")
+    );
+}
+
+#[test]
+fn configured_codex_profile_precedes_global_model_and_catalog() {
+    let raw = "model = 'global'\nprofile = 'lab'\n[profiles.lab]\nmodel = 'custom-provider-model'";
+    assert_eq!(
+        codex_default_model(Some(raw), None).as_deref(),
+        Some("custom-provider-model")
+    );
+}
+
+fn codex_default_model(raw: Option<&str>, catalog: Option<&Value>) -> Option<String> {
+    raw.and_then(|raw| toml::from_str::<CodexConfig>(raw).ok())
+        .and_then(|c| {
+            c.profile
+                .as_ref()
+                .and_then(|profile| c.profiles.get(profile))
+                .and_then(|profile| profile.model.clone())
+                .or(c.model)
+        })
+        .or_else(|| {
+            catalog?["data"]
+                .as_array()?
+                .iter()
+                .find(|m| m["isDefault"] == true)
+                .and_then(|m| m["model"].as_str().or_else(|| m["id"].as_str()))
+                .map(str::to_owned)
+        })
+}
+
 fn parse_configured_effort(raw: &str) -> Option<String> {
     toml::from_str::<CodexConfig>(raw)
         .ok()?
@@ -608,6 +1215,65 @@ pub(crate) fn find_codex_required() -> Result<PathBuf> {
     })
 }
 
+fn read_auth(home: &Path, info: &mut HarnessInfo) {
+    if let Some(auth) = read_json(home.join("auth.json")) {
+        if nonempty_str(&auth, "OPENAI_API_KEY").is_some() {
+            info.authenticated = true;
+            info.auth_method = Some("apiKey");
+        }
+        if let Some(claims) = auth
+            .get("tokens")
+            .and_then(|t| t.get("id_token"))
+            .and_then(Value::as_str)
+            .and_then(jwt_payload)
+        {
+            info.authenticated = true;
+            info.auth_method = Some("oauth");
+            info.account = nonempty_str(&claims, "email");
+            info.account_name = nonempty_str(&claims, "name");
+            if let Some(oa) = claims.get("https://api.openai.com/auth") {
+                info.plan = nonempty_str(oa, "chatgpt_plan_type").map(|p| codex_plan_label(&p));
+            }
+        }
+    }
+}
+
+/// A profile's sign-in, and with `models` its own catalog, for when the user's
+/// own Codex is signed out and has none to share.
+pub(crate) async fn profile_auth(bin: Option<&Path>, home: &Path, version: Option<&str>) -> Value {
+    let mut info = HarnessInfo::new("codex", "OpenAI Codex");
+    read_auth(home, &mut info);
+    let state = if info.authenticated {
+        super::HarnessAuthState::Ready
+    } else {
+        super::HarnessAuthState::NeedsLogin
+    };
+    let catalog = match bin {
+        Some(bin) if info.authenticated => codex_model_list(bin, Some(home)).await,
+        _ => None,
+    };
+    let mut entry = json!({
+        "authenticated": info.authenticated,
+        "supportsSteering": info.authenticated && !codex_exec_forced()
+            && version.and_then(parse_version).is_some_and(|version| version >= MIN_APP_SERVER_VERSION),
+        "authState": state,
+        "authMethod": info.auth_method,
+        "loginEligible": true,
+        "account": info.account,
+        "accountName": info.account_name,
+        "plan": info.plan,
+    });
+    let raw = std::fs::read_to_string(home.join("config.toml")).ok();
+    entry["defaultModel"] = json!(codex_default_model(raw.as_deref(), catalog.as_ref()));
+    if let Some(catalog) = catalog {
+        entry["models"] = json!(parse_model_list(
+            &catalog,
+            raw.as_deref().and_then(parse_configured_effort).as_deref()
+        ));
+    }
+    entry
+}
+
 /// One headless request on a throwaway `codex exec` thread. Deliberately
 /// *not* the session's own thread — a request there would pollute the real
 /// conversation history.
@@ -646,10 +1312,16 @@ async fn codex_one_shot(bin: &Path, request: OneShot<'_>) -> Result<String> {
             // server cwd's AGENTS.md into a request that carries its own context.
             .current_dir(std::env::temp_dir());
         prepare_env(&mut cmd);
-        cmd.env(
-            "CODEX_HOME",
-            native_store::prepare_codex(NativeStore::Isolated)?,
-        );
+        let home = match request.profile {
+            Some(id) => crate::local::agent_profiles::prepare(id, "codex")?,
+            None => native_store::prepare_codex(NativeStore::Isolated)?,
+        };
+        let sqlite = native_store::codex_home(NativeStore::Isolated);
+        cmd.env("CODEX_HOME", home);
+        cmd.args([
+            "-c",
+            &format!("sqlite_home={}", native_store::toml_string(&sqlite)),
+        ]);
         // Plain text only — an ANSI-colorizing CLI (or a synced FORCE_COLOR)
         // would otherwise write escape codes straight into the reply.
         cmd.env("NO_COLOR", "1");
@@ -756,25 +1428,8 @@ impl Codex {
                     "Set `{key}` for the configured Codex model provider."
                 ));
             }
-        } else if let Some(auth) = read_json(home.join("auth.json")) {
-            if nonempty_str(&auth, "OPENAI_API_KEY").is_some() {
-                info.authenticated = true;
-                info.auth_method = Some("apiKey");
-            }
-            if let Some(claims) = auth
-                .get("tokens")
-                .and_then(|t| t.get("id_token"))
-                .and_then(Value::as_str)
-                .and_then(jwt_payload)
-            {
-                info.authenticated = true;
-                info.auth_method = Some("oauth");
-                info.account = nonempty_str(&claims, "email");
-                info.account_name = nonempty_str(&claims, "name");
-                if let Some(oa) = claims.get("https://api.openai.com/auth") {
-                    info.plan = nonempty_str(oa, "chatgpt_plan_type").map(|p| codex_plan_label(&p));
-                }
-            }
+        } else {
+            read_auth(&home, &mut info);
         }
 
         // The `model/list` handshake is only spawned where the auth evidence
@@ -798,19 +1453,15 @@ impl Codex {
             )
             .await;
         } else {
-            let effort = configured_effort.clone();
             let (selected, probed) = super::detect::select_and_speculate(
                 "codex",
                 codex_candidates(),
                 None,
-                move |bin| {
-                    let effort = effort.clone();
-                    async move {
-                        if want_catalog {
-                            codex_model_list(&bin, effort.as_deref()).await
-                        } else {
-                            None
-                        }
+                move |bin| async move {
+                    if want_catalog {
+                        codex_model_list(&bin, None).await
+                    } else {
+                        None
                     }
                 },
             )
@@ -836,9 +1487,17 @@ impl Codex {
         info.agent_ready = info.ready();
         if info.agent_ready {
             let catalog_answered = catalog.is_some();
-            info = info.with_models(catalog.unwrap_or_default());
+            info.configured_model = codex_default_model(config_raw.as_deref(), catalog.as_ref());
+            info = info.with_models(
+                catalog
+                    .as_ref()
+                    .map(|c| parse_model_list(c, configured_effort.as_deref()))
+                    .unwrap_or_default(),
+            );
             if want_catalog && !catalog_answered {
-                info.agent_note = Some("Could not load Codex models. Re-check this harness or update Codex; the CLI default model is still available.".to_string());
+                info.agent_note = Some(
+                    "Could not load Codex models. Re-check this agent or update Codex.".to_string(),
+                );
             }
             // Old CLIs still work via the legacy exec path, but miss the
             // app-server wins (permission prompts on sandbox escalations;
@@ -916,7 +1575,7 @@ impl Harness for Codex {
     }
 
     fn name(&self) -> &'static str {
-        "Codex"
+        "OpenAI Codex"
     }
 
     fn supports_chat(&self) -> bool {
@@ -937,18 +1596,32 @@ impl Harness for Codex {
         if !runs_app_server().await {
             return Ok(CompactOutcome::Fallback);
         }
+        if let Some(profile) = &ctx.profile {
+            crate::local::agent_profiles::prepare(profile, "codex")?;
+        }
         let live = ctx.host.codex.client_for(&ctx.session_id).await;
         let client = match live {
-            Some(client) if client.resumed_thread().as_deref() == Some(thread_id) => client,
+            Some(client)
+                if client.resumed_thread().as_deref() == Some(thread_id)
+                    && client.profile == ctx.profile =>
+            {
+                client
+            }
             _ => {
-                let session = codex_native_session(thread_id).await?.ok_or_else(|| {
-                    anyhow!("Codex's saved thread is missing — cannot compact this chat")
-                })?;
+                let Some(session) = codex_native_session(thread_id, ctx.profile.is_some()).await?
+                else {
+                    if ctx.profile.is_some() {
+                        return Ok(CompactOutcome::Fallback);
+                    }
+                    return Err(anyhow!(
+                        "Codex's saved thread is missing — cannot compact this chat"
+                    ));
+                };
                 let (repo, playbook_md) = codex_playbook(&ctx.project, &ctx.session_id).await?;
                 let client = ctx
                     .host
                     .codex
-                    .ensure(&ctx.session_id, session.store)
+                    .ensure(&ctx.session_id, session.store, ctx.profile.as_deref())
                     .await?;
                 let config = match codex_turn_config(&client, &repo).await {
                     Err(_) if ctx.permission_mode == Some(PermissionMode::Bypass) => Value::Null,
@@ -1583,6 +2256,9 @@ fn apply_notification(ctx: &mut TurnCtx, method: &str, params: &Value) -> Option
         ctx.clear_retry_status();
     }
     match method {
+        "account/rateLimits/updated" => {
+            crate::local::usage::observed(&ctx.host, &ctx.harness, ctx.profile.as_deref());
+        }
         "thread/tokenUsage/updated" => {
             if let Some(last) = params.pointer("/tokenUsage/last") {
                 if let Some(used_tokens) =
@@ -1593,6 +2269,7 @@ fn apply_notification(ctx: &mut TurnCtx, method: &str, params: &Value) -> Option
                         context_window: params
                             .pointer("/tokenUsage/modelContextWindow")
                             .and_then(Value::as_u64),
+                        ..Default::default()
                     });
                 }
             }
@@ -1699,6 +2376,7 @@ fn apply_notification(ctx: &mut TurnCtx, method: &str, params: &Value) -> Option
                 ctx.report_usage(ContextUsage {
                     used_tokens: used,
                     context_window,
+                    ..Default::default()
                 });
             }
             let status = turn.get("status").and_then(Value::as_str).unwrap_or("");
@@ -2757,7 +3435,10 @@ async fn ensure_codex_pre_accept(
     native_store: NativeStore,
 ) -> Result<Arc<CodexClient>> {
     loop {
-        let ensure = ctx.host.codex.ensure(&ctx.session_id, native_store);
+        let ensure = ctx
+            .host
+            .codex
+            .ensure(&ctx.session_id, native_store, ctx.profile.as_deref());
         let result = match ctx.orx_retry_remaining() {
             Some(remaining) => tokio::time::timeout(remaining, ensure)
                 .await
@@ -2875,7 +3556,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     let (repo, playbook_md) = codex_playbook(&ctx.project, &ctx.session_id).await?;
 
     let native_session = match ctx.native_session_id.as_deref() {
-        Some(id) => codex_native_session(id).await?,
+        Some(id) => codex_native_session(id, ctx.profile.is_some()).await?,
         None => None,
     };
     let preferred_store = native_session
@@ -2944,7 +3625,10 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                 Err(err) => {
                     // Transport failures never reach this arm. Recover only if
                     // the exact rollout disappeared after the initial lookup.
-                    if codex_native_session(&id).await?.is_some() {
+                    if codex_native_session(&id, ctx.profile.is_some())
+                        .await?
+                        .is_some()
+                    {
                         ctx.mark_terminal_failure("json_rpc", err.to_string());
                         return Err(anyhow!("codex thread/resume failed: {err}"));
                     }
@@ -4021,16 +4705,20 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
             .map_err(|e| anyhow!("playbook task failed: {e}"))??;
 
     let native_session = match ctx.native_session_id.as_deref() {
-        Some(id) => codex_native_session(id).await?,
+        Some(id) => codex_native_session(id, ctx.profile.is_some()).await?,
         None => None,
     };
     let native_store = native_session
         .as_ref()
         .map(|session| session.store)
         .unwrap_or(NativeStore::Isolated);
-    let codex_home = tokio::task::spawn_blocking(move || native_store::prepare_codex(native_store))
-        .await
-        .map_err(|error| anyhow!("Codex config preparation failed: {error}"))??;
+    let profile = ctx.profile.clone();
+    let codex_home = tokio::task::spawn_blocking(move || match profile {
+        Some(id) => crate::local::agent_profiles::prepare(&id, "codex"),
+        None => native_store::prepare_codex(native_store),
+    })
+    .await
+    .map_err(|error| anyhow!("Codex config preparation failed: {error}"))??;
     let policy = if ctx.plan_mode {
         Some("read-only")
     } else {
@@ -4041,7 +4729,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
         .flatten();
     let roots: Vec<PathBuf> = if policy == Some("workspace-write") {
         [
-            data_dir.clone(),
+            data_dir,
             Some(ensure_orx_lifecycle_lock_dir()?),
             shared_git_dir(&repo).await,
         ]
@@ -4070,10 +4758,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     // subcommand rejects `-s` ("unexpected argument"), but accepts `-c` on both
     // the fresh and resume paths (verified against codex-cli 0.143), so one form
     // works for the whole session lifecycle.
-    //
-    // Yields the data dir granted as a writable root (if any), so the child's
-    // store can be pinned to it below, after `prepare_env`.
-    let data_dir_pin = match policy {
+    match policy {
         Some(policy) => {
             cmd.args([
                 "-c",
@@ -4103,16 +4788,12 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
             //     fail outright; grant the common dir (see `shared_git_dir`).
             if policy == "workspace-write" {
                 cmd.args(["-c", "sandbox_workspace_write.network_access=true"]);
-                data_dir
-            } else {
-                None
             }
         }
         None => {
             cmd.arg("--dangerously-bypass-approvals-and-sandbox");
-            None
         }
-    };
+    }
     // Reasoning level → Codex's own `model_reasoning_effort` config override.
     if let Some(effort) = codex_reasoning(ctx.reasoning_level.as_deref()) {
         cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
@@ -4123,7 +4804,9 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     if let Some(model) = &ctx.model {
         cmd.args(["-m", model]);
     }
-    if let Some(override_arg) = native_store::codex_sqlite_override(native_store, &codex_home) {
+    if let Some(override_arg) =
+        native_store::codex_sqlite_override(native_store, &codex_home, ctx.profile.is_some())
+    {
         cmd.args(["-c", &override_arg]);
     }
     // Only for the server-name collision check; an unreadable file keeps the default name.
@@ -4169,19 +4852,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     // Tag the run this sandboxed turn may launch (`orx exp run`) with the
     // session so it can be explicitly subscribed to. After prepare_env so it
     // isn't shadowed by a synced value.
-    set_chat_session_env(&mut cmd, &ctx.session_id, "codex", ctx.host.up_port());
-    // Pin the sandboxed turn's store to the exact path granted above. The
-    // grant was resolved from the host's env, but the child could resolve a
-    // different data dir — `prepare_env` injects dashboard-synced vars (a
-    // synced `ORX_DATA_DIR`/`XDG_DATA_HOME` absent from the host env), and a
-    // relative `ORX_DATA_DIR` resolves against the child's cwd, not ours.
-    // Must come after `prepare_env`: later `cmd.env` calls win, and the
-    // synced-env injection guards on the *process* env, not the cmd's map.
-    // (Unsandboxed Bypass has no grant to stay coherent with, so no pin — a
-    // synced `ORX_DATA_DIR` still wins there.)
-    if let Some(dir) = &data_dir_pin {
-        cmd.env("ORX_DATA_DIR", dir);
-    }
+    set_chat_session_env(&mut cmd, &ctx.session_id, "codex", ctx.host.up_port())?;
     ctx.persist_delivery(DeliveryState::Unknown)?;
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -4325,6 +4996,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
                     ctx.report_usage(ContextUsage {
                         used_tokens: used,
                         context_window,
+                        ..Default::default()
                     });
                 }
             }
@@ -4351,11 +5023,16 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
 
 async fn codex_native_session(
     native_id: &str,
+    profile: bool,
 ) -> Result<Option<native_store::NativeSessionLocation>> {
     let native_id = native_id.to_string();
-    tokio::task::spawn_blocking(move || native_store::codex_session(&native_id))
-        .await
-        .map_err(|error| anyhow!("codex rollout lookup failed: {error}"))?
+    tokio::task::spawn_blocking(move || {
+        native_store::codex_session(&native_id).map(|session| {
+            session.filter(|location| !profile || location.store == NativeStore::Isolated)
+        })
+    })
+    .await
+    .map_err(|error| anyhow!("codex rollout lookup failed: {error}"))?
 }
 
 fn legacy_exec_text(text: &str, plan_mode: bool) -> String {

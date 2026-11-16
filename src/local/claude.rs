@@ -45,7 +45,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use crate::error::{anyhow, Result};
 use crate::local::agent_lifecycle::{IdlePolicy, REAPER_INTERVAL};
 use crate::local::harness::claude::{
-    claude_permission_mode, find_claude, uses_permission_bridge, write_mcp_config, write_settings,
+    claude_permission_mode, uses_permission_bridge, write_mcp_config, write_settings,
     CLAUDE_ENTRYPOINT,
 };
 use crate::local::harness::{HarnessAuthState, PermissionMode};
@@ -217,9 +217,12 @@ pub struct SpawnConfig {
     pub effort: Option<String>,
     pub model: Option<String>,
     pub native_store: NativeStore,
+    pub profile: Option<String>,
     pub alphaxiv_signed_in: bool,
     /// Whether the child has its input bridge; failed setup is retried on the next turn.
     pub bridge_active: bool,
+    /// The executable detection selected, so a newer install respawns the child.
+    pub bin: Option<PathBuf>,
 }
 
 /// Everything needed to spawn (or respawn) a session's child, built per turn by
@@ -334,6 +337,15 @@ pub struct ClaudeClient {
 }
 
 impl ClaudeClient {
+    /// Marks the held segment as being recorded by a turn that will call
+    /// [`ClaudeHost::take_continuation`]; false when there is none to record.
+    pub(crate) fn claim_continuation(&self) -> bool {
+        let mut turn = self.turn.lock().unwrap();
+        let claimable = turn.sender.is_none() && turn.unclaimed.is_some() && !turn.recording;
+        turn.recording |= claimable;
+        claimable
+    }
+
     /// The config this child is currently running under.
     pub fn config(&self) -> SpawnConfig {
         self.config.lock().unwrap().clone()
@@ -356,7 +368,7 @@ impl ClaudeClient {
     /// Send a control request and await its `control_response`. `Ok(Err(msg))`
     /// is a *child-reported* failure, `Err(..)` a transport failure (child gone
     /// / timeout).
-    async fn control_request(&self, request: Value) -> Result<Result<Value, String>> {
+    pub(crate) async fn control_request(&self, request: Value) -> Result<Result<Value, String>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request_id = format!("req_{id}");
         let (tx, rx) = oneshot::channel();
@@ -739,7 +751,7 @@ async fn stop_client_at(client: Arc<ClaudeClient>, reason: &str, now: Instant) {
 /// `--resume <native_id>`. No handshake — the first turn's `system`/`init` line
 /// is the health signal.
 async fn spawn_client(spec: &SpawnSpec, auth_generation: u64) -> Result<Arc<ClaudeClient>> {
-    let bin = find_claude().ok_or_else(|| {
+    let bin = spec.config.bin.clone().ok_or_else(|| {
         anyhow!("claude not found on PATH — install Claude Code and run `claude` once to sign in")
     })?;
     let mut cmd = crate::process::tokio_command(&bin);
@@ -843,17 +855,22 @@ async fn spawn_client(spec: &SpawnSpec, auth_generation: u64) -> Result<Arc<Clau
     {
         cmd.env("CLAUDE_CODE_PROMPT_CACHE_TTL", ttl);
     }
-    let native_store = spec.config.native_store;
-    let config_home = tokio::task::spawn_blocking(move || {
-        crate::local::native_store::prepare_claude(native_store)
-    })
-    .await
-    .map_err(|error| anyhow!("Claude config preparation failed: {error}"))??;
-    cmd.env("CLAUDE_CONFIG_DIR", config_home);
-    cmd.env(
-        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
-        crate::local::native_store::claude_secure_storage_config_dir(),
-    );
+    if let Some(profile) = spec.config.profile.as_deref() {
+        crate::local::agent_profiles::home(profile, "claude-code")?;
+        cmd.envs(crate::local::agent_profiles::login_env(profile)?);
+    } else {
+        let native_store = spec.config.native_store;
+        let config_home = tokio::task::spawn_blocking(move || {
+            crate::local::native_store::prepare_claude(native_store)
+        })
+        .await
+        .map_err(|error| anyhow!("Claude config preparation failed: {error}"))??;
+        cmd.env("CLAUDE_CONFIG_DIR", config_home);
+        cmd.env(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+            crate::local::native_store::claude_secure_storage_config_dir(),
+        );
+    }
     // Stamp the launching session so `orx exp run` (a fresh subprocess the
     // agent shells out) tags its run and can explicitly subscribe this chat.
     // After prepare_env so it wins.
@@ -862,7 +879,7 @@ async fn spawn_client(spec: &SpawnSpec, auth_generation: u64) -> Result<Arc<Clau
         &spec.session_id,
         "claude-code",
         spec.chat.up_port(),
-    );
+    )?;
     // Own process group: a terminal SIGINT reaches orx up alone, which then
     // tears the resident child down deliberately (kill_session / shutdown). A
     // shared group would let Ctrl-C kill a persistent child mid-turn.
@@ -927,6 +944,8 @@ pub fn child_action(current: &SpawnConfig, wanted: &SpawnConfig) -> ChildAction 
         || current.bridge_active != wanted.bridge_active
         || current.alphaxiv_signed_in != wanted.alphaxiv_signed_in
         || current.native_store != wanted.native_store
+        || current.profile != wanted.profile
+        || current.bin != wanted.bin
     {
         return ChildAction::Respawn;
     }
@@ -1304,11 +1323,19 @@ impl ClaudeHost {
         if self.forgotten_sessions.lock().await.contains(&session) {
             return Err(anyhow!("Claude session was deleted"));
         }
+        let profile = spec.config.profile.is_some();
+        if let Some(id) = spec.config.profile.as_deref() {
+            crate::local::agent_profiles::prepare(id, "claude-code")?;
+        }
         let mut auth = self.auth_snapshot();
-        if auth.state == HarnessAuthState::Unknown && !auth.runtime_rejected {
+        if !profile && auth.state == HarnessAuthState::Unknown && !auth.runtime_rejected {
             auth = self.resolve_unknown().await;
         }
-        match auth.state {
+        match if profile {
+            HarnessAuthState::Ready
+        } else {
+            auth.state
+        } {
             HarnessAuthState::NeedsLogin => {
                 return Err(anyhow!(
                     "{}",
@@ -1323,7 +1350,7 @@ impl ClaudeHost {
             }
             HarnessAuthState::Unknown => {
                 return Err(anyhow!(
-                    "Claude Code authentication could not be verified — run `claude auth status`, then re-check the harness"
+                    "Claude Code authentication could not be verified — run `claude auth status`, then re-check the agent"
                 ));
             }
             HarnessAuthState::Ready => {}
@@ -1340,15 +1367,16 @@ impl ClaudeHost {
             {
                 self.inner.lock().await.remove(&session);
                 stop_client(live, reason.as_str()).await;
-            } else if live.auth_generation() != auth.generation {
+            } else if !profile && live.auth_generation() != auth.generation {
                 self.inner.lock().await.remove(&session);
                 stop_client(live, "authentication-changed").await;
             } else {
                 match child_action(&live.config(), &spec.config) {
                     ChildAction::Reuse => {
                         let latest = self.auth_snapshot();
-                        if latest.state == HarnessAuthState::Ready
-                            && live.auth_generation() == latest.generation
+                        if profile
+                            || (latest.state == HarnessAuthState::Ready
+                                && live.auth_generation() == latest.generation)
                         {
                             return Ok(live.register_turn(tx, self.reaper_notify.clone()));
                         }
@@ -1358,8 +1386,9 @@ impl ClaudeHost {
                     ChildAction::SetModel(model) => match live.set_model(&model).await {
                         Ok(()) => {
                             let latest = self.auth_snapshot();
-                            if latest.state == HarnessAuthState::Ready
-                                && live.auth_generation() == latest.generation
+                            if profile
+                                || (latest.state == HarnessAuthState::Ready
+                                    && live.auth_generation() == latest.generation)
                             {
                                 return Ok(live.register_turn(tx, self.reaper_notify.clone()));
                             }
@@ -1380,7 +1409,7 @@ impl ClaudeHost {
             }
         }
         auth = self.auth_snapshot();
-        if auth.state != HarnessAuthState::Ready {
+        if !profile && auth.state != HarnessAuthState::Ready {
             return Err(anyhow!(
                 "Claude Code authentication changed while preparing this session"
             ));
@@ -1404,8 +1433,9 @@ impl ClaudeHost {
                     .copied()
                     .unwrap_or_default();
                 if latest_epoch != spawn_epoch
-                    || latest.state != HarnessAuthState::Ready
-                    || latest.generation != client.auth_generation()
+                    || (!profile
+                        && (latest.state != HarnessAuthState::Ready
+                            || latest.generation != client.auth_generation()))
                 {
                     drop(guard);
                     stop_client(client, "startup-superseded").await;
@@ -1429,6 +1459,7 @@ impl ClaudeHost {
 
     /// Whether the session's child holds a segment it started on its own that
     /// no turn is starting to record.
+    #[cfg(test)]
     pub async fn has_continuation(&self, session_id: &str) -> bool {
         let live = self.inner.lock().await.get(session_id).cloned();
         live.is_some_and(|client| {
@@ -1437,16 +1468,17 @@ impl ClaudeHost {
         })
     }
 
-    /// Marks the held segment as being recorded by a turn that will call
-    /// [`Self::take_continuation`]; false when there is none to record.
+    /// The session's live child, for a caller that claims its held segment
+    /// under a lock of its own.
+    pub(crate) async fn live(&self, session_id: &str) -> Option<Arc<ClaudeClient>> {
+        self.inner.lock().await.get(session_id).cloned()
+    }
+
+    /// [`ClaudeClient::claim_continuation`] on the session's live child.
     pub async fn claim_continuation(&self, session_id: &str) -> bool {
-        let Some(live) = self.inner.lock().await.get(session_id).cloned() else {
-            return false;
-        };
-        let mut turn = live.turn.lock().unwrap();
-        let claimable = turn.sender.is_none() && turn.unclaimed.is_some() && !turn.recording;
-        turn.recording |= claimable;
-        claimable
+        self.live(session_id)
+            .await
+            .is_some_and(|client| client.claim_continuation())
     }
 
     /// Route the held segment, and what the child writes after it, to a new
@@ -1714,9 +1746,32 @@ pub(crate) mod tests {
             effort: effort.map(str::to_string),
             model: model.map(str::to_string),
             native_store: NativeStore::Isolated,
+            profile: None,
             alphaxiv_signed_in: false,
             bridge_active: bridge,
+            bin: None,
         }
+    }
+
+    #[test]
+    fn changing_profile_always_respawns_the_child() {
+        let current = cfg(None, None, Some("sonnet"), false);
+        let mut wanted = current.clone();
+        wanted.profile = Some("claude-012345abcd".into());
+        assert_eq!(child_action(&current, &wanted), ChildAction::Respawn);
+        let mut second = wanted.clone();
+        second.profile = Some("claude-abcdefghij".into());
+        assert_eq!(child_action(&wanted, &second), ChildAction::Respawn);
+    }
+
+    #[test]
+    fn a_newly_selected_claude_respawns_the_child() {
+        let mut current = cfg(None, None, Some("sonnet"), false);
+        current.bin = Some(PathBuf::from("/user/claude"));
+        let mut wanted = current.clone();
+        assert_eq!(child_action(&current, &wanted), ChildAction::Reuse);
+        wanted.bin = Some(PathBuf::from("/managed/claude"));
+        assert_eq!(child_action(&current, &wanted), ChildAction::Respawn);
     }
 
     #[cfg(unix)]

@@ -16,6 +16,7 @@
 
 pub(crate) mod cleanup;
 mod container;
+pub(crate) mod hosts;
 #[cfg(unix)]
 mod prepared;
 pub(crate) mod service;
@@ -342,9 +343,8 @@ fn ssh_options(
     ];
     opts.extend(multiplexing);
     opts.extend(target.extra_opts.iter().cloned());
-    if let Some(config) = config {
-        opts.extend(["-F".into(), config.to_string_lossy().into_owned()]);
-    }
+    let config = config.map_or_else(crate::config::ssh_config, std::path::Path::to_path_buf);
+    opts.extend(["-F".into(), config.to_string_lossy().into_owned()]);
     opts
 }
 
@@ -403,7 +403,7 @@ pub(crate) fn forward_args(
 pub(crate) struct InteractiveConnection {
     pub args: Vec<String>,
     #[cfg(unix)]
-    _lock: std::fs::File,
+    _lock: crate::file_lock::FileLock,
 }
 
 /// Retires unusable Unix masters and holds their lock through the interactive login.
@@ -465,7 +465,7 @@ pub(crate) async fn prepare_interactive_connection(
 }
 
 #[cfg(unix)]
-async fn lock_master(path: &std::path::Path) -> Result<std::fs::File> {
+async fn lock_master(path: &std::path::Path) -> Result<crate::file_lock::FileLock> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -480,7 +480,7 @@ async fn lock_master(path: &std::path::Path) -> Result<std::fs::File> {
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
     }
-    Ok(file)
+    Ok(crate::file_lock::FileLock::new(file))
 }
 
 #[cfg(unix)]
@@ -895,8 +895,8 @@ mod tests {
         let target = SshTarget::alias("mybox");
         assert_eq!(target.dest, "mybox");
         assert!(target.extra_opts.is_empty());
-        // No `-p`/`-o Strict…` beyond the shared multiplexing opts.
-        let shared = 10 + multiplexing_opts(&target).len();
+        // No `-p`/`-o Strict…` beyond the shared multiplexing opts and `-F`.
+        let shared = 12 + multiplexing_opts(&target).len();
         assert_eq!(ssh_opts(&target, true).len(), shared);
     }
 

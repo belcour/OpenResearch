@@ -55,7 +55,7 @@ import {
 import { useMutate } from "@clo/react-mutation";
 
 import { nativeOptions, sessionAcpHarness } from "../acp";
-import { deriveComposerSelection, resolveHarnessDefaultModel } from "../modelSelection";
+import { deriveComposerSelection, selectionHarness } from "../modelSelection";
 
 import { RemoteConnectionStrip, useRemoteConnection } from "../RemoteRuntime";
 
@@ -76,7 +76,7 @@ import { formatForDisplay, matchesKeyboardEvent, useAppHotkeys, useHotkey } from
 import { appHotkeys } from "../hotkeys";
 import { copyToClipboard } from "../clipboard";
 import { readClipboardImage } from "../clipboardImage";
-import { autoDir, ltr } from "../i18n";
+import { autoDir, fmtBytes, ltr } from "../i18n";
 import { navigateKeyboardList } from "../keyboardNavigation";
 import { useLocale } from "../locale";
 import {
@@ -147,6 +147,7 @@ import {
   type CitedMessage,
   type ChatSearchHit,
   type Harness,
+  type HarnessId,
   type Project,
   type PromptAnswer,
   type RuntimeInfo,
@@ -219,9 +220,8 @@ import { MentionMenu, type MentionMatch } from "./MentionMenu";
 import { useDebouncedValue } from "./NewProjectForm";
 import { MessageWithChips } from "./SkillChips";
 import { ComposerEditor, type ChipSource, type ComposerEditorHandle } from "./ComposerEditor";
-import { WorkspaceConnection } from "./WorkspaceConnection";
+import { StatusStrip } from "./StatusStrip";
 import { SidebarToggle } from "./Header";
-import { AccountChip } from "./AccountChip";
 import {
   defaultSelection,
   harnessLabel,
@@ -229,7 +229,8 @@ import {
   usePopover,
   type ModelSelection,
 } from "./ModelPicker";
-import { ContextMeter } from "./ContextMeter";
+import { useModelName } from "./pickerAgents";
+import { UsageMenu } from "./UsageMenu";
 import { renderNote } from "./agentNote";
 import {
   canonicalSkillName,
@@ -3217,6 +3218,23 @@ function MessageTime({ at, className = "" }: { at: number; className?: string })
     </time>
   );
 }
+
+/** Where a chat moved to another agent, its model named as the picker names it. */
+function SwitchNotice({ part }: { part: ChatPart }) {
+  const modelName = useModelName();
+  const input = part.state?.input ?? {};
+  const harness = inputString(input, "harness") ?? "";
+  const name = inputString(input, "name") ?? harness;
+  const model = inputString(input, "model");
+  const label = model && (modelName({ harness: harness as HarnessId, profile: inputString(input, "profile"), model }) ?? modelLabel(model));
+  return (
+    <div role="status" data-provider-switch className="flex items-center gap-2 py-2 text-sm text-subtext">
+      <ArrowRightLeft size={16} className="shrink-0" aria-hidden="true" />
+      <span className="min-w-0 wrap-anywhere">{label ? m.chat_switched_agent({ agent: name, model: label }) : m.chat_switched_agent_only({ agent: name })}</span>
+    </div>
+  );
+}
+
 /** The pager stays visible once a prompt has more than one version — hiding it
  * would leave no sign that the other versions exist. */
 function ForkControls({
@@ -3379,18 +3397,7 @@ export const Message = memo(function Message({
   const shell = shellExchangePart(message);
   if (shell) return <ShellExchangeCard part={shell} />;
   const providerSwitch = message.parts.find((part) => part.tool === "provider_switch");
-  if (providerSwitch) {
-    const input = providerSwitch.state?.input ?? {};
-    const harness = inputString(input, "harness") ?? "";
-    const name = inputString(input, "name") ?? harness;
-    const model = inputString(input, "model");
-    return (
-      <div role="status" data-provider-switch className="flex items-center gap-2 py-2 text-sm text-subtext">
-        <ArrowRightLeft size={16} className="shrink-0" aria-hidden="true" />
-        <span className="min-w-0 wrap-anywhere">{m.chat_switched_agent({ agent: name, model: model ? modelLabel(model) : m.model_picker_default_model() })}</span>
-      </div>
-    );
-  }
+  if (providerSwitch) return <SwitchNotice part={providerSwitch} />;
   if (message.role === "user") {
     const sent = message.parts.filter((part): part is ChatPart & { orx: OrxSource } => Boolean(part.orx));
     if (sent.length > 0) {
@@ -4381,8 +4388,11 @@ const Transcript = memo(function Transcript({
     rangeExtractor,
     scrollToFn: (offset, options, instance) => {
       // virtual-core passes size corrections with the last scroll event's offset; apply them to the live scrollTop so a scroll since isn't undone.
-      const target = options.adjustments === undefined ? offset : (instance.scrollElement?.scrollTop ?? offset) + options.adjustments;
-      programmaticScroll.current = target;
+      const element = instance.scrollElement;
+      const target = options.adjustments === undefined ? offset : (element?.scrollTop ?? offset) + options.adjustments;
+      // A write that leaves scrollTop in place fires no scroll event, and a stale record would claim the user's next one.
+      const landing = element ? Math.max(0, Math.min(target, element.scrollHeight - element.clientHeight)) : target;
+      programmaticScroll.current = element && Math.abs(landing - element.scrollTop) < 0.5 ? null : landing;
       elementScroll(target, { behavior: options.behavior }, instance);
     },
   });
@@ -4702,48 +4712,18 @@ function SessionFilterMenu({
   );
 }
 
-/** Per-character stagger, and the ceiling on the whole run — a long title
- * shouldn't take a second and a half to finish arriving. */
-const TITLE_CHAR_STAGGER_MS = 14;
-const TITLE_STAGGER_CAP_MS = 500;
-/** How long the reveal flag stays set: the capped stagger plus one character's
- * 240ms animation, plus slack. After this the title renders as plain text. */
-const TITLE_REVEAL_CLEAR_MS = 1200;
+/** How long the reveal flag stays set: the 700ms sweep plus slack. After this
+ * a remount (scrolling the rail, switching sessions) shows a static title. */
+const TITLE_REVEAL_CLEAR_MS = 1000;
 
-/** A session title that materializes character by character when a
+/** A session title that fades in behind a left-to-right mask when a
  * harness-generated one replaces the first-line placeholder. `animate` is false
  * everywhere else (initial load, renames, re-renders), and then this renders the
- * bare string — the animated form is deliberately the exception.
- *
- * The characters are `aria-hidden` and the whole title rides an `aria-label`:
- * a screen reader must hear one title, not forty single-letter spans. */
+ * bare string — the animated form is deliberately the exception. The text stays
+ * one run so kerning and antialiasing match the static title it settles into. */
 function TitleReveal({ title, animate }: { title: string; animate: boolean }) {
   if (!animate) return <>{title}</>;
-  return (
-    <span className="title-reveal" aria-label={title}>
-      {Array.from(title).map((ch, i) =>
-        // Spaces stay plain inline boxes: the animated characters must be
-        // inline-block (transform doesn't apply to inline boxes), but an
-        // inline-block space collapses to zero width and eats the word gap.
-        ch === " " ? (
-          <span key={i} aria-hidden>
-            {ch}
-          </span>
-        ) : (
-          <span
-            key={i}
-            aria-hidden
-            className="title-reveal-char inline-block animate-[title-char-in_240ms_ease-out_both] [@media((prefers-reduced-motion:_reduce))]:animate-none"
-            style={{
-              animationDelay: `${Math.min(i * TITLE_CHAR_STAGGER_MS, TITLE_STAGGER_CAP_MS)}ms`,
-            }}
-          >
-            {ch}
-          </span>
-        ),
-      )}
-    </span>
-  );
+  return <span className="title-reveal">{title}</span>;
 }
 
 /** One Recents row. Hover swaps the timestamp for a three-dot menu with
@@ -5421,6 +5401,7 @@ export function ChatPanel({
   const { data: activeRuns = [] } = useQuery(listChatActiveRunsQuery());
   const [state, dispatch, historyQuery] = useChatState(projectId, mainView === "chat" ? activeId : null);
   const { data: harnesses = EMPTY_HARNESSES } = useQuery(getHarnessesQuery());
+  const modelName = useModelName();
   const [selection, setSelection] = useState<ModelSelection | null>(preferredAgent);
   useEffect(() => setSelection(preferredAgent), [preferredAgent]);
   // Unsent composer tweaks (model/mode/reasoning) for the *open* session — the
@@ -5485,6 +5466,7 @@ export function ChatPanel({
   const scrollToEndRef = useRef<(() => void) | null>(null);
   const stickToBottom = useRef(true);
   const programmaticScroll = useRef<number | null>(null);
+  const lastTranscriptTop = useRef(0);
   const [transcriptAtBottom, setTranscriptAtBottom] = useState(true);
   const composerRef = useRef<ComposerEditorHandle>(null);
   useEffect(() => {
@@ -5554,8 +5536,8 @@ export function ChatPanel({
     target?: { scope: typeof composerScopeRef.current; stashKey: string },
   ) {
     // Per-file and total caps keep the base64-inflated (~33%) request body
-    // under the backend's 64 MB limit — a single 30 MB file or a batch summing
-    // to 40 MB both stay clear once encoded.
+    // under the backend's 64 MiB limit — a single 30 MiB file or a batch summing
+    // to 40 MiB both stay clear once encoded.
     const MAX_BYTES = 30 * 1024 * 1024;
     const TOTAL_BYTES = 40 * 1024 * 1024;
     setAttachError(null);
@@ -5570,11 +5552,11 @@ export function ChatPanel({
         continue;
       }
       if (file.size > MAX_BYTES) {
-        setAttachError(m.chat_attachment_too_large({ name: ltr(file.name) }));
+        setAttachError(m.chat_attachment_too_large({ name: ltr(file.name), size: fmtBytes(MAX_BYTES) }));
         continue;
       }
       if (total + file.size > TOTAL_BYTES) {
-        setAttachError(m.chat_attachments_total_too_large());
+        setAttachError(m.chat_attachments_total_too_large({ size: fmtBytes(TOTAL_BYTES) }));
         continue;
       }
       total += file.size;
@@ -5662,6 +5644,7 @@ export function ChatPanel({
   const rawSelection: ModelSelection | null = openSession
     ? {
       harness: openSession.harness,
+      profile: openSession.profile ?? null,
       model: sessionOverride.model !== undefined ? sessionOverride.model
         : retryOptions?.model !== undefined ? retryOptions.model : openSession.model,
       serviceTier: sessionOverride.serviceTier !== undefined ? sessionOverride.serviceTier
@@ -5675,9 +5658,7 @@ export function ChatPanel({
       ? { ...savedSelection, ...sessionOverride }
       : null;
   const { data: skills = EMPTY_SKILLS } = useQuery(getSkillsQuery(rawSelection?.harness, projectId));
-  const catalogHarness = rawSelection
-    ? harnesses.find((h) => h.id === rawSelection.harness)
-    : undefined;
+  const catalogHarness = selectionHarness(harnesses, rawSelection);
   const activeHarness = sessionAcpHarness(openSession, catalogHarness);
   const acpOptions = nativeOptions(openSession?.nativeConfiguration, { model: m.model_picker_model(), mode: m.model_picker_mode() });
   const acpModel = acpOptions.find((option) => option.category === "model");
@@ -5764,14 +5745,15 @@ export function ChatPanel({
   const mentionPaths = useMemo(() => new Set(mentionPool.map((candidate) => candidate.path)), [mentionPool]);
   const activeMentionIdx = Math.min(mentionIdx, Math.max(0, mentionMatches.length - 1));
   useEffect(() => setMentionIdx(0), [mentionQuery]);
-  // Reconcile the selected model's settings, including stale saved preferences,
-  // without replacing custom model IDs that are absent from the catalog.
+  // Reconcile the selected model's settings, including stale saved preferences.
   const composerSelection = deriveComposerSelection(acpModel && rawSelection ? { ...rawSelection, model: acpModel.currentValue } : rawSelection, activeHarness);
   // Reasoning choices follow the *selected model*, not just the harness — an
   // OpenCode model with no `variants` hides the picker entirely, and Codex's
   // top tiers appear only on the models that accept them.
   const reasoning = reasoningFor(activeHarness, composerSelection?.model);
   const selectedModel = activeHarness?.models.find((model) => model.id === composerSelection?.model);
+  // A new chat starts only on a model its agent lists; a side chat runs its parent's.
+  const canRun = !!activeHarness?.agentReady && (!!activeId || !!sideParentSessionId || !!selectedModel);
   // OpenCode reports a text-only model's image Read as both success and error, so refuse up front.
   const noImageInputError = selectedModel?.imageInput === false
     ? m.chat_model_no_image_input({ model: ltr(harnessModelLabel(selectedModel)) })
@@ -5800,7 +5782,8 @@ export function ChatPanel({
     composerLiveRef.current = { ...composerLiveRef.current, pendingClientTurn: null };
   };
   const selectModel = (next: Partial<ModelSelection>) => {
-    if (openSession && composerSelection && next.harness && next.harness !== openSession.harness) {
+    const otherAgent = next.harness !== undefined && (next.harness !== openSession?.harness || (next.profile ?? null) !== (openSession.profile ?? null));
+    if (openSession && composerSelection && otherAgent) {
       const agent = { ...composerSelection, ...next };
       const scope = stashKey;
       invalidatePendingRetry();
@@ -5849,14 +5832,14 @@ export function ChatPanel({
     void onPreferredAgentChange(merged).catch(() => {});
     if (openSession) {
       setSessionOverride((cur) => ({ ...cur, ...next }));
-    } else if (next.harness && next.harness !== composerSelection.harness) {
+    } else if (next.harness && (next.harness !== composerSelection.harness || (next.profile ?? null) !== (composerSelection.profile ?? null))) {
       setSessionOverride({});
     }
   };
-  function startHarness(harness: Harness) {
-    const model = resolveHarnessDefaultModel(harness);
+  function startHarness(harness: Harness, model: string) {
     const next: ModelSelection = {
       harness: harness.id,
+      profile: harness.profile?.id ?? null,
       model,
       serviceTier: reconcileServiceTier(harness.catalogPending ? undefined : harness, model, null),
       permissionMode: harness.options?.defaultPermissionMode ?? null,
@@ -6089,7 +6072,7 @@ export function ChatPanel({
     // Declaring the goal before the first message is the natural moment for it,
     // so an empty composer gets a session rather than losing the goal.
     if (!sessionId) {
-      if (!activeHarness?.agentReady || !composerSelection) {
+      if (!canRun || !composerSelection) {
         setSettingsError(m.chat_selected_harness_unavailable());
         return;
       }
@@ -6221,8 +6204,7 @@ export function ChatPanel({
               next.set(ev.session.id, (cur.get(ev.session.id) ?? 0) + 1);
               return next;
             });
-            // Drop the flag once the run is over (longest stagger + one char
-            // duration, plus slack) so later re-renders show a static title.
+            // Drop the flag once the sweep is over so later remounts don't replay it.
             window.setTimeout(() => {
               setTitleReveals((cur) => {
                 if (!cur.has(ev.session.id)) return cur;
@@ -6243,7 +6225,7 @@ export function ChatPanel({
 
   useEffect(() => onChatEvent((event) => {
     if (event.type === "reconnected") void syncSessionList(true);
-    if (event.type === "runsChanged" || event.type === "reconnected") {
+    if (event.type === "runsChanged") {
       void queryClient.invalidateQueries({ queryKey: listChatActiveRunsQuery().queryKey });
     }
   }), [syncSessionList]);
@@ -6314,14 +6296,6 @@ export function ChatPanel({
     }
   }, [queued]);
   const historyLoading = !!activeId && historyQuery.isPending;
-  const waitingSessions = useMemo(() => {
-    const waiting = new Set<string>();
-    for (const [id, messages] of Object.entries(state.messagesBySession)) {
-      const busy = state.busySessions.has(id);
-      if (hasPendingInput(activePath(messages, state.activeLeafBySession[id]), busy)) waiting.add(id);
-    }
-    return waiting;
-  }, [state.busySessions, state.messagesBySession, state.activeLeafBySession]);
   // Async questions can await an answer while the agent continues working.
   const awaitingInput = busy && messages.some((message) => message.parts.some(
     (part) => part.type === "prompt" && part.prompt && !part.prompt.resolved && part.prompt.nativeId,
@@ -6487,7 +6461,7 @@ export function ChatPanel({
   const historyError = !historyQuery.data ? historyQuery.error : null;
   const starterVisible = mainView === "chat" && !embedded && !threadMounted && !contentLoading && !contentError && !historyLoading && !historyError;
   const starterQuery = useQuery({
-    ...getProjectStarterPromptsQuery(projectId, starterHarness ?? "claude-code", starterModel, getLocale()),
+    ...getProjectStarterPromptsQuery(projectId, starterHarness ?? "claude-code", starterModel, getLocale(), composerSelection?.profile ?? null),
     enabled: starterVisible && starterHarness !== null,
     subscribed: starterVisible && starterHarness !== null,
   });
@@ -6523,11 +6497,15 @@ export function ChatPanel({
   const demoHintVisible =
     projectId === DEMO_PROJECT_ID && draft === DEMO_RUN_EXPERIMENT_PROMPT && !demoHintDismissed;
   const updateTranscriptBottom = useCallback((el: HTMLDivElement) => {
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const atBottom = distance < 60;
     // Wheels, keys, focus moves and screen readers scroll unannounced; only the virtualizer's own scrolls are recorded.
     const programmatic = programmaticScroll.current !== null && Math.abs(el.scrollTop - programmaticScroll.current) <= 1;
+    const movedUp = el.scrollTop < lastTranscriptTop.current;
     programmaticScroll.current = null;
-    if (!programmatic) stickToBottom.current = atBottom;
+    lastTranscriptTop.current = el.scrollTop;
+    // Trackpads scroll a pixel at a time, so any upward scroll lets go before the next resize re-pins it.
+    if (!programmatic) stickToBottom.current = distance <= 1 || (atBottom && !movedUp);
     setTranscriptAtBottom(atBottom);
   }, []);
   const pinTranscriptToBottom = useCallback(() => {
@@ -6812,8 +6790,9 @@ export function ChatPanel({
       }
       return;
     }
-    if (!activeHarness?.agentReady) {
+    if (!canRun) {
       clearFailedPlanCommand();
+      if (activeHarness?.agentReady) setModelPickerRequest((request) => request + 1);
       return;
     }
     // `composerSelection` already resolves to the open session's settings (+ any
@@ -6936,6 +6915,7 @@ export function ChatPanel({
     let session = sideParentSessionId
       ? await mutOpenSideChat.runAsHeadlessPromise(workspace, sideParentSessionId, {})
       : await mutCreateChatSession.runAsHeadlessPromise(workspace, projectId, selection.harness, {
+        profile: selection.profile,
         model: selection.model,
         serviceTier: selection.serviceTier,
         permissionMode: selection.permissionMode,
@@ -6990,7 +6970,7 @@ export function ChatPanel({
     setSkillMenuDismissed(false);
     let sid = activeId;
     if (!sid) {
-      if (!activeHarness?.agentReady || !composerSelection) {
+      if (!canRun || !composerSelection) {
         restoreDraft();
         setSettingsError(m.chat_selected_harness_unavailable());
         return;
@@ -7281,15 +7261,15 @@ export function ChatPanel({
   useHotkey(appHotkeys["chat.find"], openFind, { enabled: mainView === "chat" && !contentInert && (embedded ? searchRegion === "right" : searchRegion !== "right"), requireReset: true, ignoreInputs: false, capture: true, conflictBehavior: "allow" });
   useHotkey("Mod+Shift+Enter", newTask, { enabled: !embedded, requireReset: true, conflictBehavior: "allow" });
 
-  const sessionWaiting = (session: ChatSession) => state.messagesBySession[session.id]
-    ? waitingSessions.has(session.id) : session.awaitingInput === true;
+  const sessionWaiting = (session: ChatSession) => session.id === activeId && historyQuery.data
+    ? hasPendingInput(messages, busy) : session.awaitingInput === true;
   const sessionBusy = (project: Project, session: ChatSession) => project.id === projectId ? state.busySessions.has(session.id) : session.busy;
   const sidebarRows: SidebarRow[] = [];
   if (sidebarGrouping === "projects") shownProjects.forEach((project, index) => {
     const query = projectSessionsQueries[index];
     const projectSessions = project.id === projectId ? sessions : query.data ?? EMPTY_SESSIONS;
     const matching = projectSessions
-      .filter((session) => !session.sideParentSessionId && (matchesFilter(sessionFilter, session.archived) || session.id === activeId))
+      .filter((session) => !session.sideParentSessionId && !session.delegate && (matchesFilter(sessionFilter, session.archived) || session.id === activeId))
       .sort((a, b) => b.updatedAt - a.updatedAt);
     const chatLimit = chatLimits[project.id] ?? 6;
     let visible = matching.slice(0, chatLimit);
@@ -7305,7 +7285,7 @@ export function ChatPanel({
   if (sidebarGrouping === "list") {
     const flat = flatSessions.data?.pages.flatMap((page) => page.sessions) ?? [];
     const selected = sessions.find((session) => session.id === activeId);
-    if (selected && !flat.some((session) => session.id === selected.id)) flat.push(selected);
+    if (selected && !selected.delegate && !flat.some((session) => session.id === selected.id)) flat.push(selected);
     flat.filter((session) => !deletedSessionIds.has(session.id)).sort((a, b) => b.updatedAt - a.updatedAt).forEach((session) => {
       const project = sidebarProjects.find((project) => project.id === session.projectId);
       if (project) sidebarRows.push({ kind: "chat", project, session });
@@ -7465,7 +7445,7 @@ export function ChatPanel({
           ).map(({ row, top, index }) => {
             const project = row.project;
             const s = row.kind === "chat" ? row.session : null;
-            const sessionHarness = s ? sessionAcpHarness(s, harnesses.find((h) => h.id === s.harness)) : undefined;
+            const sessionHarness = s ? sessionAcpHarness(s, selectionHarness(harnesses, s)) : undefined;
             const sessionModel = sessionHarness?.models.find((model) => model.id === s?.model);
             return (
               <div
@@ -7511,7 +7491,7 @@ export function ChatPanel({
                       cardWarmUntil={cardWarmUntil}
                       projectName={sidebarGrouping === "list" ? project.name : undefined}
                       harnessLogo={sessionHarness?.logo}
-                      modelName={sessionModel ? harnessModelLabel(sessionModel) : s.model}
+                      modelName={modelName(s) ?? (sessionModel ? harnessModelLabel(sessionModel) : s.model)}
                       active={s.id === activeId && mainView === "chat"}
                       unread={unreadSessionIds.has(s.id)}
                       busy={sessionBusy(project, s)}
@@ -7588,7 +7568,7 @@ export function ChatPanel({
         <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 bottom-0 z-5 h-3 bg-linear-to-t from-background to-transparent" />
       </>}
       </div>
-      <div className="flex shrink-0 items-center gap-1 border-t border-border px-1 py-1"><AccountChip onDetails={() => onSelectMainView("openresearch")} /><WorkspaceConnection runtime={runtime} /></div>
+      <StatusStrip runtime={runtime} onDetails={() => onSelectMainView("openresearch")} />
     </aside>
   );
 
@@ -7610,7 +7590,6 @@ export function ChatPanel({
     return (
       <>
         {displayedRail}
-        {!embedded && !railOpen && <WorkspaceConnection runtime={runtime} corner />}
         <section inert={contentInert} className="chat-pane flex-1 min-w-0 flex flex-col bg-background min-h-0">
           {(!railOpen || mobileRail) && <div className="mac-titlebar-spacer flex h-12 mac-titlebar:h-titlebar shrink-0 items-center">{railReopen}</div>}
           {/* Keyed per view so no tab inherits the chat thread's or another tab's scroll offset. */}
@@ -7626,7 +7605,6 @@ export function ChatPanel({
   return (
     <>
       {displayedRail}
-      {!embedded && !railOpen && <WorkspaceConnection runtime={runtime} corner />}
       <section inert={contentInert} data-side-chat={embedded || undefined} className="chat-pane relative flex-1 min-w-0 flex flex-col bg-background min-h-0">
         {/* Header — session title on the left, end-pane view switchers on the
           right, fading into the chat below (sessions live in the rail). */}
@@ -8222,7 +8200,7 @@ export function ChatPanel({
                         disabled={
                           bashMode
                             ? switchingAgent || !shellCommand || (!activeId && !activeHarness?.agentReady)
-                            : switchingAgent || !activeHarness?.agentReady ||
+                            : switchingAgent || !canRun ||
                             (!draft.trim() && annotations.length === 0)
                         }
                       >
@@ -8362,7 +8340,15 @@ export function ChatPanel({
                     mutSetChatConfiguration.run(workspace, openSession, optionId, value);
                   }}
                 />
-                <ContextMeter usage={openSession?.contextUsage} />
+                <UsageMenu
+                  usage={openSession?.contextUsage}
+                  busy={busy}
+                  harness={composerSelection?.harness}
+                  profile={composerSelection?.profile}
+                  sessionId={openSession?.id ?? null}
+                  remote={runtime.kind === "ssh"}
+                  onCompact={activeHarness?.supportsCompaction && openSession ? () => void compactSession() : undefined}
+                />
               </div>
             </div>
           </div>

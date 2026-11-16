@@ -33,6 +33,10 @@ impl Acp {
         info.bin_path = crate::local::acp::executable_path(&self.0.executable)
             .map(|path| path.to_string_lossy().into_owned());
         info.installed = info.bin_path.is_some();
+        info.managed = info
+            .bin_path
+            .as_deref()
+            .is_some_and(|bin| super::managed::version_of(std::path::Path::new(bin)).is_some());
         if let Some(preset) = crate::local::acp::presets().into_iter().find(|preset| {
             preset.launch.id == self.0.id
                 || (std::path::Path::new(&self.0.executable)
@@ -83,6 +87,7 @@ impl Harness for Acp {
     }
 
     async fn detect(&self) -> Option<HarnessInfo> {
+        super::managed::select(&self.0.id).await;
         let mut info = self.detection();
         if info.adapter_missing {
             auth::detect(&self.0, &mut info).await;
@@ -96,13 +101,20 @@ impl Harness for Acp {
             Ok(connection) => {
                 info.installed = true;
                 info.agent_ready = true;
-                info.version = connection["agentInfo"]["version"]
-                    .as_str()
-                    .map(str::to_owned);
-                info.models.push(super::ModelInfo::new("default"));
+                info.version = info
+                    .bin_path
+                    .as_deref()
+                    .and_then(|bin| super::managed::version_of(std::path::Path::new(bin)))
+                    .map(|version| version.to_string())
+                    .or_else(|| {
+                        connection["agentInfo"]["version"]
+                            .as_str()
+                            .map(str::to_owned)
+                    });
                 auth::detect(&self.0, &mut info).await;
                 match crate::local::acp::discover_models(&self.0).await {
                     Ok(configuration) => {
+                        info.configured_model = current_model(&configuration).map(str::to_owned);
                         let models = advertised_models(&configuration);
                         if !models.is_empty() {
                             info.models = models;
@@ -152,14 +164,77 @@ impl Harness for Acp {
     }
 }
 
-fn advertised_models(configuration: &Value) -> Vec<super::ModelInfo> {
-    fn choices(options: &Value, models: &mut Vec<super::ModelInfo>) {
+#[cfg(test)]
+#[test]
+fn deepseek_model_routes_are_deduplicated() {
+    let names = [
+        "deepseek-v4-flash",
+        "DeepSeek-V4.1-Flash",
+        "DeepSeek-V4-Pro",
+        "DeepSeek-V4.1-Flash",
+        "DeepSeek-V4-Pro",
+    ];
+    let options: Vec<Value> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| serde_json::json!({"value": i.to_string(), "name": name}))
+        .collect();
+    let models = advertised_models(
+        &serde_json::json!({"configOptions":[{"category":"model","type":"select","options":options}]}),
+    );
+    assert_eq!(models.len(), 3);
+    assert_eq!(models[1].id, "1");
+}
+
+#[test]
+fn current_models_are_native_and_missing_catalogs_stay_empty() {
+    let legacy = serde_json::json!({"models":{"currentModelId":"opus","availableModels":[{"modelId":"opus","name":"Opus"}]}});
+    assert_eq!(current_model(&legacy), Some("opus"));
+    let options = serde_json::json!({"configOptions":[{"category":"model","type":"select","currentValue":"42","options":[{"value":"42","name":"Custom"}]}]});
+    assert_eq!(current_model(&options), Some("42"));
+    assert_eq!(advertised_models(&options)[0].id, "42");
+    assert!(advertised_models(&serde_json::json!({})).is_empty());
+    assert!(advertised_models(
+        &serde_json::json!({"models":{"availableModels":[{"modelId":"default","name":"Default"}]}})
+    )
+    .is_empty());
+}
+
+pub(crate) fn current_model(configuration: &Value) -> Option<&str> {
+    configuration["configOptions"]
+        .as_array()
+        .and_then(|options| options.iter().find(|o| o["category"] == "model"))
+        .and_then(|o| o["currentValue"].as_str())
+        .or_else(|| configuration["models"]["currentModelId"].as_str())
+        .filter(|id| crate::local::harness::concrete_model(id))
+}
+
+pub(crate) fn advertised_models(configuration: &Value) -> Vec<super::ModelInfo> {
+    fn choices(options: &Value, models: &mut Vec<super::ModelInfo>, current: Option<&str>) {
         for option in options.as_array().into_iter().flatten() {
             if option["options"].is_array() {
-                choices(&option["options"], models);
+                choices(&option["options"], models, current);
             } else if let (Some(id), Some(name)) =
                 (option["value"].as_str(), option["name"].as_str())
             {
+                if !crate::local::harness::concrete_model(id) {
+                    continue;
+                }
+                let normalized = |name: &str| {
+                    name.chars()
+                        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+                        .flat_map(char::to_lowercase)
+                        .collect::<String>()
+                };
+                if let Some(model) = models.iter_mut().find(|model| {
+                    normalized(model.display_name.as_deref().unwrap_or(&model.id))
+                        == normalized(name)
+                }) {
+                    if Some(id) == current {
+                        model.id = id.to_string();
+                    }
+                    continue;
+                }
                 models.push(
                     super::ModelInfo::new(id)
                         .with_label(Some(name), option["description"].as_str()),
@@ -173,7 +248,11 @@ fn advertised_models(configuration: &Value) -> Vec<super::ModelInfo> {
             .iter()
             .filter(|option| option["category"] == "model" && option["type"] == "select")
         {
-            choices(&option["options"], &mut models);
+            choices(
+                &option["options"],
+                &mut models,
+                current_model(configuration),
+            );
         }
         return models;
     }
@@ -182,8 +261,12 @@ fn advertised_models(configuration: &Value) -> Vec<super::ModelInfo> {
         .into_iter()
         .flatten()
         .filter_map(|model| {
+            let id = model["modelId"].as_str()?;
+            if !crate::local::harness::concrete_model(id) {
+                return None;
+            }
             Some(
-                super::ModelInfo::new(model["modelId"].as_str()?)
+                super::ModelInfo::new(id)
                     .with_label(model["name"].as_str(), model["description"].as_str()),
             )
         })
@@ -248,7 +331,7 @@ async fn run_turn(ctx: &mut TurnCtx, definition: &Definition) -> Result<()> {
     if let Some(model) = ctx
         .model
         .as_deref()
-        .filter(|model| apply_model && *model != "default")
+        .filter(|model| apply_model && crate::local::harness::concrete_model(model))
     {
         let configuration = Store::open()?
             .acp_session_state(&ctx.session_id)?
@@ -452,6 +535,13 @@ pub(crate) async fn prompt_session(ctx: &mut TurnCtx, session: &OpenSession) -> 
                         eprintln!("orx up: could not persist ACP token usage: {error}");
                     }
                 }
+                if let (Some(execution), Some(cost)) = (ctx.usage_execution_id(), &tools.session_cost) {
+                    if let Err(error) = Store::open().and_then(|store| {
+                        store.record_acp_cost(execution, &ctx.harness, &session.native_id, cost, session.restored)
+                    }) {
+                        eprintln!("orx up: could not persist ACP cost: {error}");
+                    }
+                }
                 if result["stopReason"] == "cancelled" { return Err(anyhow!("Agent turn was cancelled")); }
                 break result;
             }
@@ -546,6 +636,8 @@ struct ToolUpdates {
     terminals: HashMap<String, String>,
     /// Tool activity since the last text, which the next text follows as a new part.
     text_break: bool,
+    /// The session's running cost from the agent's latest `usage_update`.
+    session_cost: Option<crate::store::Cost>,
 }
 
 impl ToolUpdates {
@@ -663,10 +755,14 @@ fn apply_event(ctx: &mut TurnCtx, event: Event, tools: &mut ToolUpdates) -> Resu
                 }
             }
             Some("usage_update") => {
+                if let Some(cost) = usage_cost(&update["cost"]) {
+                    tools.session_cost = Some(cost);
+                }
                 if let Some(used_tokens) = update["used"].as_u64() {
                     ctx.report_usage(crate::local::chat::ContextUsage {
                         used_tokens,
                         context_window: update["size"].as_u64(),
+                        ..Default::default()
                     });
                 }
             }
@@ -675,6 +771,11 @@ fn apply_event(ctx: &mut TurnCtx, event: Event, tools: &mut ToolUpdates) -> Resu
     }
     ctx.maybe_flush();
     Ok(())
+}
+
+/// ACP's `{amount, currency}`, the session's cumulative cost.
+fn usage_cost(cost: &Value) -> Option<crate::store::Cost> {
+    crate::store::Cost::of(cost["amount"].as_f64()?, cost["currency"].as_str()?)
 }
 
 fn permission_input(tool: &Value) -> Option<Value> {
@@ -696,27 +797,35 @@ fn render_tool(ctx: &mut TurnCtx, id: &str, tool: &Value, terminals: &HashMap<St
         _ => "running",
     };
     let raw_input = tool.get("rawInput");
-    let (name, input) = match (tool["title"].as_str(), tool["name"].as_str()) {
-        (Some("subagent" | "task" | "Agent" | "Task"), _) => ("task", raw_input.cloned()),
-        (Some("SubagentHandback"), _) => ("SubagentHandback", raw_input.cloned()),
+    let antigravity = ctx.harness == "antigravity";
+    let native = tool["name"].as_str().filter(|_| antigravity);
+    let (name, input) = match (tool["title"].as_str(), native) {
+        (Some("subagent" | "task" | "Agent" | "Task"), _) => ("task".into(), raw_input.cloned()),
+        (Some("SubagentHandback"), _) => ("SubagentHandback".into(), raw_input.cloned()),
         // agy sends its own tool name and argument names, as in its transcripts.
-        (_, Some(native)) if ctx.harness == "antigravity" => {
-            super::antigravity::normalize_tool(native, raw_input)
-        }
+        (_, Some(native)) => super::antigravity::normalize_tool(native, raw_input),
         _ => (
             match tool["kind"].as_str() {
                 Some("execute") => "bash",
                 Some(kind) => kind,
                 None => "tool",
-            },
+            }
+            .into(),
             raw_input.cloned(),
         ),
     };
     let mut part = WirePart::tool(format!("acp-tool-{id}"), name, status, None);
     if let Some(state) = part.state.as_mut() {
-        state.title = tool["title"].as_str().map(str::to_owned);
+        // agy titles an MCP call with no more than its tool's name.
+        state.title = tool["title"]
+            .as_str()
+            .filter(|title| native.is_none_or(|native| !title.contains(native)))
+            .map(str::to_owned);
         state.input = input;
-        state.output = tool_output(tool, terminals);
+        state.output = match tool_output(tool, terminals) {
+            Some(output) if antigravity => Some(super::antigravity::without_hook_notice(&output)),
+            output => output,
+        };
     }
     ctx.upsert_part(part);
 }
@@ -859,6 +968,33 @@ mod tests {
             &json!({"configOptions":[], "models":{"availableModels":[{"modelId":"legacy"}]}})
         )
         .is_empty());
+    }
+
+    #[test]
+    fn usage_updates_keep_the_sessions_latest_cost() {
+        let mut ctx = TurnCtx::test_stub();
+        let mut tools = ToolUpdates::default();
+        for update in [
+            json!({"sessionUpdate": "usage_update", "used": 900, "size": 200000,
+                   "cost": {"amount": 0.42, "currency": "usd"}}),
+            json!({"sessionUpdate": "usage_update", "used": 1200, "size": 200000}),
+            json!({"sessionUpdate": "usage_update", "used": 1300,
+                   "cost": {"amount": "lots", "currency": "USD"}}),
+        ] {
+            apply_event(&mut ctx, Event::Update(update), &mut tools).unwrap();
+        }
+        let cost = tools.session_cost.unwrap();
+        assert_eq!((cost.micros, cost.currency.as_str()), (420_000, "USD"));
+        assert_eq!(ctx.context_usage.unwrap().used_tokens, 1300);
+        assert!(usage_cost(&json!({"amount": 1, "currency": ""})).is_none());
+        assert!(usage_cost(&json!({"amount": -1, "currency": "EUR"})).is_none());
+        assert_eq!(
+            usage_cost(&json!({"amount": 2.5, "currency": "EUR"})).unwrap(),
+            crate::store::Cost {
+                micros: 2_500_000,
+                currency: "EUR".into()
+            }
+        );
     }
 
     #[test]

@@ -25,8 +25,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 
 use super::detect::{
     bin_version, nonempty_str, parse_version, read_json, HarnessAuthState, HarnessInfo, ModelInfo,
@@ -47,6 +49,9 @@ use crate::local::claude::{starts_segment, SpawnConfig, SpawnSpec, TurnEvent};
 use crate::local::native_store::{self, NativeStore};
 use crate::local::opencode::ensure_playbook;
 use crate::local::shell_env::installs;
+use crate::local::usage::{
+    remaining_percent, PlanExtraUsage, PlanWindow, Read, Snapshot, Unanswered,
+};
 
 /// Harness-wide effort choices when no model-specific catalog is available.
 const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -136,7 +141,7 @@ pub(crate) fn parse_auth_status(exit_code: Option<i32>, stdout: &[u8], sequence:
         .and_then(Value::as_str);
     let method = reported_method.and_then(|method| match method.to_ascii_lowercase().as_str() {
         "oauth" | "claude.ai" => Some("oauth"),
-        "api-key" | "api_key" | "apikey" => Some("apiKey"),
+        "api-key" | "api_key" | "apikey" | "api_key_helper" => Some("apiKey"),
         "third_party" | "third-party" => Some("thirdParty"),
         _ => None,
     });
@@ -171,18 +176,74 @@ pub(crate) fn parse_auth_status(exit_code: Option<i32>, stdout: &[u8], sequence:
 }
 
 async fn probe_auth(bin: &Path, sequence: u64) -> AuthProbe {
+    probe_auth_at(bin, sequence, None).await
+}
+
+async fn probe_auth_at(bin: &Path, sequence: u64, home: Option<&Path>) -> AuthProbe {
     let mut cmd = crate::process::tokio_command(bin);
     cmd.args(["auth", "status", "--json"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     prepare_env(&mut cmd);
+    profile_env(&mut cmd, home);
     match super::detect::detect_spawn_output_timed(cmd, AUTH_STATUS_TIMEOUT).await {
         Some(Ok(out)) => parse_auth_status(out.status.code(), &out.stdout, sequence),
         // A timeout or a spawn failure: no evidence of anything, least of all a
         // credential conflict.
         _ => AuthProbe::unknown(sequence),
     }
+}
+
+/// The profile's sign-in and model catalog.
+pub(crate) async fn profile_auth(bin: Option<&Path>, home: &Path, version: Option<&str>) -> Value {
+    let (probe, ultracode) = match bin {
+        Some(bin) => {
+            let (probe, ultracode) =
+                probe_auth_and_ultracode(bin, next_auth_sequence(), Some(home)).await;
+            (gate_oauth_version(probe, version), ultracode)
+        }
+        None => (AuthProbe::unknown(0), false),
+    };
+    let catalog = match bin {
+        Some(bin) if probe.state == HarnessAuthState::Ready => {
+            claude_models_response(bin.to_path_buf(), Some(home.to_path_buf())).await
+        }
+        _ => None,
+    };
+    let account = read_json(home.join(".claude.json")).and_then(|v| v.get("oauthAccount").cloned());
+    let credentials = read_json(home.join(".credentials.json"));
+    let tier = credentials
+        .as_ref()
+        .and_then(|v| v.get("claudeAiOauth"))
+        .and_then(|v| v.get("rateLimitTier"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            account
+                .as_ref()
+                .and_then(|v| v.get("organizationRateLimitTier"))
+                .and_then(Value::as_str)
+        });
+    let authenticated = probe.state == HarnessAuthState::Ready;
+    let mut entry = json!({
+        "authenticated": authenticated,
+        "supportsSteering": authenticated,
+        "authState": probe.state,
+        "authMethod": probe.method,
+        "authProvider": probe.provider,
+        "loginEligible": true,
+        "authCheckFailed": probe.failed_check,
+        "account": account.as_ref().filter(|_| authenticated).and_then(|v| nonempty_str(v, "emailAddress")),
+        "accountName": account.as_ref().filter(|_| authenticated).and_then(|v| nonempty_str(v, "displayName").or_else(|| nonempty_str(v, "fullName"))),
+        "plan": authenticated.then(|| billing_label(probe.subscription_type.as_deref(), tier,
+            account.as_ref().and_then(|v| v.get("billingType")).and_then(Value::as_str))).flatten(),
+    });
+    entry["defaultModel"] =
+        json!(configured_model(home).or_else(|| catalog.as_ref().and_then(claude_default_model)));
+    if let Some(catalog) = catalog {
+        entry["models"] = json!(parse_claude_model_list(&catalog, ultracode));
+    }
+    entry
 }
 
 /// The environment-credential overlay both auth paths share. Headless Claude
@@ -252,13 +313,13 @@ pub(crate) async fn current_auth_state() -> AuthProbe {
 
 pub(crate) fn auth_recovery_note(method: Option<&str>, provider: Option<&str>) -> &'static str {
     if external_provider(method, provider) {
-        "Check the configured Claude Code provider and run `claude auth status`, then re-check this harness."
+        "Check the configured Claude Code provider and run `claude auth status`, then re-check this agent."
     } else if has_api_credential() {
-        "Claude Code rejected the configured `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. Replace or unset it, then re-check this harness."
+        "Claude Code rejected the configured `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. Replace or unset it, then re-check this agent."
     } else if method == Some("oauth") || provider == Some("firstParty") {
-        "Sign in with `claude auth login`, then re-check this harness."
+        "Sign in with `claude auth login`, then re-check this agent."
     } else {
-        "Check Claude Code authentication with `claude auth status`, then re-check this harness."
+        "Check Claude Code authentication with `claude auth status`, then re-check this agent."
     }
 }
 
@@ -284,13 +345,18 @@ pub(crate) fn external_provider(method: Option<&str>, provider: Option<&str>) ->
 ///
 /// Any failure reports unsupported: a missing choice is a smaller harm than a
 /// choice that silently runs at the default effort.
-async fn probe_auth_and_ultracode(bin: &Path, sequence: u64) -> (AuthProbe, bool) {
+async fn probe_auth_and_ultracode(
+    bin: &Path,
+    sequence: u64,
+    home: Option<&Path>,
+) -> (AuthProbe, bool) {
     let mut cmd = crate::process::tokio_command(bin);
     cmd.args(["--effort", CLAUDE_ULTRACODE, "auth", "status", "--json"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_env(&mut cmd);
+    profile_env(&mut cmd, home);
     let out = match super::detect::detect_spawn_output_timed(cmd, AUTH_STATUS_TIMEOUT).await {
         Some(Ok(out)) => out,
         _ => return (AuthProbe::unknown(sequence), false),
@@ -305,24 +371,44 @@ async fn probe_auth_and_ultracode(bin: &Path, sequence: u64) -> (AuthProbe, bool
     let mut probe = parse_auth_status(out.status.code(), &out.stdout, sequence);
     if warned && probe.state == HarnessAuthState::Unknown {
         // The parser rejected `--effort` and never reached `auth status`.
-        probe = probe_auth(bin, sequence).await;
+        probe = probe_auth_at(bin, sequence, home).await;
     }
     (apply_env_credential_override(probe), ultracode)
 }
 
-/// The `list_models` transport — a control request over `--print`
-/// stream-json, the same data its `/model` menu renders. This is the Claude
-/// analogue of codex's `model/list` and opencode's `models --verbose`; a
-/// curated table here shipped effort tiers on Haiku, which the catalog says
-/// supports none.
+/// Points a probe at a profile's home and its own Keychain entry.
+fn profile_env(cmd: &mut Command, home: Option<&Path>) {
+    if let Some(home) = home {
+        cmd.env("CLAUDE_CONFIG_DIR", home)
+            .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", home);
+    }
+}
+
+/// The `list_models` catalog, the same data Claude's `/model` menu renders.
+/// This is the Claude analogue of codex's `model/list` and opencode's
+/// `models --verbose`; a curated table here shipped effort tiers on Haiku,
+/// which the catalog says supports none.
 ///
-/// One shot: spawn, write the control request, read until its
-/// `control_response` (skipping stream noise), kill the child. Any failure —
-/// spawn, timeout, a CLI too old for the subtype — returns `None` and the
-/// caller reports an unavailable catalog. The raw `response` payload comes
-/// back unparsed: the ultracode probe decides the parse, and detection runs
-/// both children concurrently.
-async fn claude_models_response(bin: PathBuf) -> Option<Value> {
+/// Any failure, a CLI too old for the subtype included, returns `None` and the
+/// caller reports an unavailable catalog. The raw payload comes back unparsed:
+/// the ultracode probe decides the parse, and detection runs both children
+/// concurrently.
+async fn claude_models_response(bin: PathBuf, home: Option<PathBuf>) -> Option<Value> {
+    claude_control(bin, home, json!({ "subtype": "list_models" }))
+        .await
+        .ok()?
+        .ok()
+}
+
+/// One control request on a throwaway `--print` stream-json child: spawn,
+/// write the request, read until its `control_response` (skipping stream
+/// noise), kill the child. The inner `Err` is the response the CLI sent
+/// instead of an answer.
+async fn claude_control(
+    bin: PathBuf,
+    home: Option<PathBuf>,
+    request: Value,
+) -> std::result::Result<std::result::Result<Value, Value>, Unanswered> {
     // Acquire the spawn lane before the deadline — queue time must not spend
     // the child's execution budget.
     let permit = super::detect::detect_spawn_permit().await;
@@ -337,23 +423,29 @@ async fn claude_models_response(bin: PathBuf) -> Option<Value> {
             "--verbose",
         ]);
         prepare_env(&mut cmd);
+        profile_env(&mut cmd, home.as_deref());
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let (mut child, _permit) = super::detect::spawn_with_permit(cmd, permit).await.ok()?;
-        let mut stdin = child.stdin.take()?;
-        let mut lines = BufReader::new(child.stdout.take()?).lines();
+        let (mut child, _permit) = super::detect::spawn_with_permit(cmd, permit)
+            .await
+            .map_err(Unanswered::Spawn)?;
+        let mut stdin = child.stdin.take().ok_or(Unanswered::Closed)?;
+        let mut lines = BufReader::new(child.stdout.take().ok_or(Unanswered::Closed)?).lines();
 
         use tokio::io::AsyncWriteExt;
         let req = serde_json::json!({
             "type": "control_request",
-            "request_id": "orx_list_models",
-            "request": { "subtype": "list_models" },
+            "request_id": "orx_control",
+            "request": request,
         });
         let mut line = req.to_string();
         line.push('\n');
-        stdin.write_all(line.as_bytes()).await.ok()?;
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|_| Unanswered::Closed)?;
 
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(v) = serde_json::from_str::<Value>(&line) else {
@@ -362,25 +454,347 @@ async fn claude_models_response(bin: PathBuf) -> Option<Value> {
             if v.get("type").and_then(Value::as_str) != Some("control_response") {
                 continue;
             }
-            let resp = v.get("response")?;
-            if resp.get("request_id").and_then(Value::as_str) != Some("orx_list_models") {
+            let Some(resp) = v.get("response") else {
+                continue;
+            };
+            if resp.get("request_id").and_then(Value::as_str) != Some("orx_control") {
                 continue;
             }
-            // An `error` subtype has no inner response.
-            return resp.get("response").cloned();
+            return Ok(match resp.get("subtype").and_then(Value::as_str) {
+                Some("success") => Ok(resp.get("response").cloned().unwrap_or(Value::Null)),
+                _ => Err(resp.clone()),
+            });
         }
-        None
+        Err(Unanswered::Closed)
     };
     tokio::time::timeout(Duration::from_secs(15), fut)
         .await
-        .ok()
-        .flatten()
+        .unwrap_or(Err(Unanswered::TimedOut))
 }
 
-pub(crate) async fn external_model_catalog(bin: PathBuf, ultracode: bool) -> Vec<ModelInfo> {
-    super::detect::timed_probe("claude-code", "models", claude_models_response(bin))
+/// The account's plan limits from `get_usage`, which Claude Code marks
+/// experimental: a shape this can't read is a failed read, never a guess.
+pub(crate) async fn read_plan(bin: PathBuf, home: Option<PathBuf>) -> Read {
+    let request = json!({ "subtype": "get_usage", "skip_behaviors": true });
+    match claude_control(bin.clone(), home, request).await {
+        Err(unanswered) => Read::Failed(unanswered.message("Claude Code", &bin)),
+        Ok(Ok(usage)) => parse_plan(&usage),
+        Ok(Err(error)) => {
+            let message = error.get("error").and_then(Value::as_str).unwrap_or("");
+            if error.get("error_code").and_then(Value::as_str) == Some("unsupported_request")
+                || message.starts_with("Unsupported control request subtype")
+            {
+                Read::Unsupported
+            } else if message.is_empty() {
+                Read::Failed("Claude Code couldn't read this plan's limits.".into())
+            } else {
+                Read::Failed(format!(
+                    "Claude Code couldn't read this plan's limits: {message}"
+                ))
+            }
+        }
+    }
+}
+
+/// `get_usage`'s answer, as far as the plan needs it.
+#[derive(Deserialize)]
+struct GetUsage {
+    rate_limits_available: bool,
+    subscription_type: Option<String>,
+    rate_limits: Option<RateLimits>,
+}
+
+#[derive(Deserialize)]
+struct RateLimits {
+    five_hour: Option<UsageWindow>,
+    seven_day: Option<UsageWindow>,
+    seven_day_opus: Option<UsageWindow>,
+    seven_day_sonnet: Option<UsageWindow>,
+    model_scoped: Option<Vec<ModelWindow>>,
+    extra_usage: Option<ExtraUsage>,
+}
+
+#[derive(Deserialize)]
+struct UsageWindow {
+    utilization: Option<f64>,
+    resets_at: Option<String>,
+}
+
+impl UsageWindow {
+    /// None without a utilization: the window is unknown, so it is left out rather than drawn
+    /// full.
+    fn left(self, minutes: u64, model: Option<&str>) -> Option<PlanWindow> {
+        Some(PlanWindow {
+            minutes: Some(minutes),
+            model: model.map(str::to_string),
+            remaining_percent: remaining_percent(self.utilization?),
+            resets_at: self.resets_at,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ModelWindow {
+    display_name: String,
+    #[serde(flatten)]
+    window: UsageWindow,
+}
+
+/// Amounts in minor units: cents for the dollar.
+#[derive(Deserialize)]
+struct ExtraUsage {
+    is_enabled: Option<bool>,
+    monthly_limit: Option<f64>,
+    used_credits: Option<f64>,
+    currency: Option<String>,
+}
+
+fn parse_plan(usage: &Value) -> Read {
+    let Ok(usage) = GetUsage::deserialize(usage) else {
+        return Read::Failed("Claude Code reported usage in a form orx can't read yet.".into());
+    };
+    if !usage.rate_limits_available {
+        return Read::NoPlan;
+    }
+    let Some(limits) = usage.rate_limits else {
+        return Read::Failed("Claude Code couldn't reach claude.ai for this plan's limits.".into());
+    };
+
+    let mut windows: Vec<PlanWindow> = [
+        (limits.five_hour, 300, None),
+        (limits.seven_day, 10080, None),
+        (limits.seven_day_opus, 10080, Some("Opus")),
+        (limits.seven_day_sonnet, 10080, Some("Sonnet")),
+    ]
+    .into_iter()
+    .filter_map(|(window, minutes, model)| window?.left(minutes, model))
+    .collect();
+    for row in limits.model_scoped.into_iter().flatten() {
+        let label = row.display_name;
+        windows.retain(|window| {
+            window
+                .model
+                .as_deref()
+                .is_none_or(|model| !model.eq_ignore_ascii_case(&label))
+        });
+        windows.extend(row.window.left(10080, Some(&label)));
+    }
+    if windows.is_empty() {
+        return Read::Failed(
+            "Claude Code said this plan has limits but reported none of them.".into(),
+        );
+    }
+
+    let micros = |cents: f64| (cents * 10_000.0) as u64;
+    let extra_usage = limits
+        .extra_usage
+        .filter(|extra| extra.is_enabled == Some(true));
+    Read::Plan(Snapshot {
+        plan: billing_label(usage.subscription_type.as_deref(), None, None),
+        windows,
+        credits: None,
+        extra_usage: extra_usage.map(|extra| PlanExtraUsage {
+            used_micros: extra.used_credits.map_or(0, micros),
+            limit_micros: extra.monthly_limit.map(micros),
+            currency: extra
+                .currency
+                .map_or("USD".into(), |currency| currency.to_ascii_uppercase()),
+        }),
+        resets: None,
+    })
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn window(minutes: u64, model: Option<&str>, remaining: f64, resets: &str) -> PlanWindow {
+        PlanWindow {
+            minutes: Some(minutes),
+            model: model.map(str::to_string),
+            remaining_percent: remaining,
+            resets_at: Some(resets.into()),
+        }
+    }
+
+    /// `get_usage` for a Max subscription, in the shape Claude Code 2.1.323's
+    /// own schema declares.
+    #[test]
+    fn a_subscription_reads_as_what_is_left_of_each_window() {
+        let usage = json!({
+            "session": {"total_cost_usd": 0, "model_usage": {}},
+            "subscription_type": "max",
+            "rate_limits_available": true,
+            "rate_limits": {
+                "five_hour": {"utilization": 38.4, "resets_at": "2026-11-13T23:00:00.000Z"},
+                "seven_day": {"utilization": 104, "resets_at": "2026-11-17T08:00:00.000Z"},
+                "seven_day_oauth_apps": null,
+                "seven_day_opus": {"utilization": 12, "resets_at": "2026-11-17T08:00:00.000Z"},
+                "seven_day_sonnet": null,
+                "model_scoped": [
+                    {"display_name": "Fable", "utilization": 84, "resets_at": "2026-11-17T08:00:00.000Z"},
+                    {"display_name": "opus", "utilization": 20, "resets_at": "2026-11-17T08:00:00.000Z"},
+                    {"display_name": "Haiku", "utilization": null, "resets_at": null}
+                ],
+                "extra_usage": {"is_enabled": true, "monthly_limit": 5000, "used_credits": 1234,
+                    "utilization": 25, "currency": "usd"},
+                "a_window_from_a_later_release": {"utilization": "?"}
+            },
+            "behaviors": null
+        });
+        let Read::Plan(snapshot) = parse_plan(&usage) else {
+            panic!("{:?}", parse_plan(&usage));
+        };
+        let week = "2026-11-17T08:00:00.000Z";
+        assert_eq!(
+            snapshot.windows,
+            [
+                window(300, None, 61.6, "2026-11-13T23:00:00.000Z"),
+                window(10080, None, 0.0, week),
+                window(10080, Some("Fable"), 16.0, week),
+                window(10080, Some("opus"), 80.0, week),
+            ]
+        );
+        assert_eq!(snapshot.plan.as_deref(), Some("Max"));
+        assert_eq!(
+            snapshot.extra_usage,
+            Some(PlanExtraUsage {
+                used_micros: 12_340_000,
+                limit_micros: Some(50_000_000),
+                currency: "USD".into()
+            })
+        );
+
+        let mut off = usage.clone();
+        off["rate_limits"]["extra_usage"]["is_enabled"] = json!(false);
+        let Read::Plan(snapshot) = parse_plan(&off) else {
+            panic!()
+        };
+        assert_eq!(snapshot.extra_usage, None);
+    }
+
+    /// Live from Claude Code 2.1.323 signed in with an API key.
+    #[test]
+    fn an_api_key_has_no_plan() {
+        let usage = json!({"session": {"total_cost_usd": 0, "total_api_duration_ms": 0,
+            "total_duration_ms": 312, "total_lines_added": 0, "total_lines_removed": 0,
+            "model_usage": {}}, "subscription_type": null, "rate_limits_available": false,
+            "rate_limits": null, "behaviors": null});
+        assert_eq!(parse_plan(&usage), Read::NoPlan);
+    }
+
+    #[test]
+    fn a_shape_it_cannot_read_fails_rather_than_guessing() {
+        for usage in [
+            json!({}),
+            json!({"rate_limits_available": "yes"}),
+            json!({"rate_limits_available": true, "rate_limits": []}),
+            json!({"rate_limits_available": true, "rate_limits": {"five_hour": {"utilization": "38%"}}}),
+            json!({"rate_limits_available": true, "rate_limits": {"seven_day": 12}}),
+            json!({"rate_limits_available": true, "rate_limits": {"model_scoped": [{"utilization": 3}]}}),
+            json!({"rate_limits_available": true, "rate_limits": {"five_hour": {"utilization": 1, "resets_at": 5}}}),
+        ] {
+            assert!(matches!(parse_plan(&usage), Read::Failed(_)), "{usage}");
+        }
+        // Rate limits apply, but claude.ai didn't answer this time.
+        let unreachable = json!({"rate_limits_available": true, "rate_limits": null});
+        assert!(matches!(parse_plan(&unreachable), Read::Failed(_)));
+        // A plan with limits is never shown with none.
+        for limits in [
+            json!({}),
+            json!({"five_hour": null, "seven_day": {"utilization": null, "resets_at": null}}),
+        ] {
+            let usage = json!({"rate_limits_available": true, "rate_limits": limits});
+            assert!(matches!(parse_plan(&usage), Read::Failed(_)), "{usage}");
+        }
+    }
+
+    #[test]
+    fn the_compact_point_is_reported_only_while_auto_compact_is_on_and_cleared_when_off() {
+        // Live from 2.1.323 on a 1M-token model.
+        let on = json!({"autoCompactThreshold": 967000, "isAutoCompactEnabled": true,
+            "maxTokens": 1000000, "totalTokens": 27631});
+        assert_eq!(compact_at(&on), Some(Some(967000)));
+        let off = json!({"autoCompactThreshold": 967000, "isAutoCompactEnabled": false});
+        assert_eq!(compact_at(&off), Some(None));
+        assert_eq!(
+            compact_at(&json!({"isAutoCompactEnabled": true})),
+            Some(None)
+        );
+        assert_eq!(compact_at(&json!({"maxTokens": 1000000})), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_claude_too_old_for_get_usage_is_unsupported() {
+        let dir = crate::local::git::TemporaryDirectory::new("orx-claude-usage").unwrap();
+        let fake = |name: &str, answer: &str| {
+            let path = dir.path().join(name);
+            let script = format!(
+                "#!/bin/sh\nread request\necho '{{\"type\":\"system\",\"subtype\":\"init\"}}'\necho '{answer}'\n"
+            );
+            orx_test_support::write_executable(&path, script, 0o755).unwrap();
+            path
+        };
+        let old = fake(
+            "old",
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"orx_control","error":"Unsupported control request subtype: get_usage"}}"#,
+        );
+        assert_eq!(read_plan(old, None).await, Read::Unsupported);
+
+        let refused = fake(
+            "refused",
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"orx_control","error":"get_usage is not supported in this context"}}"#,
+        );
+        assert!(
+            matches!(read_plan(refused, None).await, Read::Failed(message) if message.contains("not supported in this context"))
+        );
+
+        let api_key = fake(
+            "api-key",
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"orx_control","response":{"rate_limits_available":false,"rate_limits":null}}}"#,
+        );
+        assert_eq!(read_plan(api_key, None).await, Read::NoPlan);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_claude_that_is_gone_or_silent_says_which() {
+        let dir = crate::local::git::TemporaryDirectory::new("orx-claude-silent").unwrap();
+        let missing = dir.path().join("claude");
+        let Read::Failed(message) = read_plan(missing.clone(), None).await else {
+            panic!("a missing binary is a failed read");
+        };
+        assert!(
+            message.contains(&missing.display().to_string()),
+            "{message}"
+        );
+        assert!(!message.contains("15 seconds"), "{message}");
+
+        let exits = dir.path().join("exits");
+        orx_test_support::write_executable(&exits, "#!/bin/sh\nread request\n", 0o755).unwrap();
+        let Read::Failed(message) = read_plan(exits, None).await else {
+            panic!("an agent that exits is a failed read");
+        };
+        assert!(message.contains("exited"), "{message}");
+    }
+}
+
+pub(crate) async fn external_model_catalog(
+    bin: PathBuf,
+    ultracode: bool,
+) -> (Vec<ModelInfo>, Option<String>) {
+    super::detect::timed_probe("claude-code", "models", claude_models_response(bin, None))
         .await
-        .map(|response| parse_claude_model_list(&response, ultracode))
+        .map(|response| {
+            (
+                parse_claude_model_list(&response, ultracode),
+                configured_model(&crate::local::native_store::claude_home(
+                    crate::local::native_store::NativeStore::Legacy,
+                ))
+                .or_else(|| claude_default_model(&response)),
+            )
+        })
         .unwrap_or_default()
 }
 
@@ -398,16 +812,16 @@ async fn claude_spec_probes(bin: PathBuf, sequence: u64) -> (AuthProbe, bool, Op
         super::detect::spawn_timed_probe(
             "claude-code",
             "models",
-            claude_models_response(bin.clone()),
+            claude_models_response(bin.clone(), None),
         )
     });
     let (auth, ultracode) = super::detect::timed_probe(
         "claude-code",
         "auth+ultracode",
-        probe_auth_and_ultracode(&bin, sequence),
+        probe_auth_and_ultracode(&bin, sequence, None),
     )
     .await;
-    // External provider model enumeration can stall; the CLI default remains usable.
+    // External provider enumeration is deferred so auth can settle first.
     let external = external_provider(auth.method, auth.provider.as_deref());
     let models = match models {
         Some(task) if auth.state == HarnessAuthState::Ready && !external => {
@@ -421,11 +835,79 @@ async fn claude_spec_probes(bin: PathBuf, sequence: u64) -> (AuthProbe, bool, Op
             None
         }
         None if auth.state == HarnessAuthState::Ready && !external => {
-            super::detect::timed_probe("claude-code", "models", claude_models_response(bin)).await
+            super::detect::timed_probe("claude-code", "models", claude_models_response(bin, None))
+                .await
         }
         None => None,
     };
     (auth, ultracode, models)
+}
+
+#[test]
+fn catalog_default_is_resolved_and_plan_alias_is_excluded() {
+    let catalog = json!({"models":[{"value":"default","resolvedModel":"claude-opus-5-5"},{"value":"opus","resolvedModel":"claude-opus-5-5"},{"value":"opusplan"},{"value":"custom"}]});
+    assert_eq!(
+        claude_default_model(&catalog).as_deref(),
+        Some("claude-opus-5-5")
+    );
+    assert_eq!(
+        parse_claude_model_list(&catalog, false)
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["opus", "custom"]
+    );
+}
+
+#[test]
+fn configured_plan_alias_resolves_like_a_missing_model() {
+    if !crate::config::in_test_child(&[]) {
+        return;
+    }
+    let root = crate::local::git::TemporaryDirectory::new("orx-claude-model").unwrap();
+    for (setting, expected) in [
+        ("opusplan", "claude-opus-5-5"),
+        ("custom-opus", "custom-opus"),
+    ] {
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"model":setting}).to_string(),
+        )
+        .unwrap();
+        let mut info = HarnessInfo::new("claude-code", "Claude Code");
+        info.agent_ready = true;
+        info.models = vec![
+            ModelInfo::new("opusplan"),
+            ModelInfo::new("claude-opus-5-5"),
+        ];
+        super::resolve_model(&mut info, configured_model(root.path()).as_deref());
+        assert_eq!(info.default_model.as_deref(), Some(expected));
+        assert!(!info.models.iter().any(|model| model.id == "opusplan"));
+        let routes = crate::local::model_routes::models(&json!({"harnesses":[info]}), &[]);
+        assert!(routes
+            .iter()
+            .flat_map(|model| &model.routes)
+            .all(|route| route.model != "opusplan"));
+    }
+}
+
+fn configured_model(home: &Path) -> Option<String> {
+    crate::local::shell_env::var("ANTHROPIC_MODEL")
+        .and_then(|model| model.into_string().ok())
+        .or_else(|| {
+            read_json(home.join("settings.json"))
+                .and_then(|settings| settings["model"].as_str().map(str::to_owned))
+        })
+        .filter(|model| super::concrete_model(model))
+}
+
+pub(crate) fn claude_default_model(result: &Value) -> Option<String> {
+    result["models"]
+        .as_array()?
+        .iter()
+        .find(|m| m["value"] == "default")?["resolvedModel"]
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// `list_models` response → per-model `ModelInfo`. Split from the transport
@@ -433,8 +915,7 @@ async fn claude_spec_probes(bin: PathBuf, sequence: u64) -> (AuthProbe, bool, Op
 ///
 /// * `value` is the id the CLI's own picker submits (aliases like `sonnet`,
 ///   `opus[1m]`), so it's what we store and pass back as `--model`.
-/// * The `default` entry is skipped — the composer's "Default model" row (a
-///   null model) already means "let the CLI pick".
+/// * Model-less and hybrid planning aliases are excluded.
 /// * A model without `supportedEffortLevels` (Haiku) gets an empty list, which
 ///   hides the reasoning picker — same absent-vs-empty contract as opencode.
 /// * `ultracode` is appended where the CLI accepts it (see
@@ -448,7 +929,7 @@ fn parse_claude_model_list(result: &Value, ultracode: bool) -> Vec<ModelInfo> {
         .iter()
         .filter_map(|m| {
             let value = m.get("value").and_then(Value::as_str)?;
-            if value == "default" {
+            if !crate::local::harness::concrete_model(value) {
                 return None;
             }
             let mut efforts: Vec<&str> = m
@@ -520,8 +1001,9 @@ fn billing_label(
     value: Option<&str>,
 ) -> Option<String> {
     match (subscription, tier, value) {
-        (Some("max") | None, Some("default_claude_max_5x"), _) => Some("Max 5x".into()),
-        (Some("max") | None, Some("default_claude_max_20x"), _) => Some("Max 20x".into()),
+        // The enum keeps the tiers' old names; Claude sells them as Max and Ultra.
+        (Some("max") | None, Some("default_claude_max_5x"), _) => Some("Max".into()),
+        (Some("max") | None, Some("default_claude_max_20x"), _) => Some("Ultra".into()),
         (Some("max"), _, _) => Some("Max".into()),
         (Some("pro"), _, _) => Some("Pro".into()),
         (_, _, Some("stripe_subscription" | "stripe_subscription_contracted")) => {
@@ -578,14 +1060,19 @@ async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Result<String> {
     .current_dir(std::env::temp_dir());
     prepare_env(&mut cmd);
     cmd.env("CLAUDE_CODE_ENTRYPOINT", CLAUDE_ENTRYPOINT);
-    cmd.env(
-        "CLAUDE_CONFIG_DIR",
-        native_store::prepare_claude(NativeStore::Isolated)?,
-    );
-    cmd.env(
-        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
-        native_store::claude_secure_storage_config_dir(),
-    );
+    if let Some(profile) = request.profile {
+        crate::local::agent_profiles::home(profile, "claude-code")?;
+        cmd.envs(crate::local::agent_profiles::login_env(profile)?);
+    } else {
+        cmd.env(
+            "CLAUDE_CONFIG_DIR",
+            native_store::prepare_claude(NativeStore::Isolated)?,
+        );
+        cmd.env(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+            native_store::claude_secure_storage_config_dir(),
+        );
+    }
     // Plain text only — an ANSI-colorizing CLI (or a synced FORCE_COLOR) would
     // otherwise write escape codes straight into the reply.
     cmd.env("NO_COLOR", "1");
@@ -704,8 +1191,7 @@ impl ClaudeCode {
                         credential_tier.as_deref(),
                         None,
                     );
-                    if let Some(acct) = crate::config::home_dir()
-                        .and_then(|h| read_json(h.join(".claude.json")))
+                    if let Some(acct) = read_json(native_store::claude_config_file())
                         .and_then(|cfg| cfg.get("oauthAccount").cloned())
                     {
                         info.account = nonempty_str(&acct, "emailAddress");
@@ -731,15 +1217,19 @@ impl ClaudeCode {
             info.supports_steering = true;
             // The speculated `list_models` response is parsed here, where the
             // ultracode verdict has landed.
+            info.configured_model = configured_model(&crate::local::native_store::claude_home(
+                crate::local::native_store::NativeStore::Legacy,
+            ))
+            .or_else(|| spec_models.as_ref().and_then(claude_default_model));
             let models = spec_models.and_then(|resp| {
                 let parsed = parse_claude_model_list(&resp, ultracode);
                 (!parsed.is_empty()).then_some(parsed)
             });
             if models.is_none() && !snapshot {
                 info.agent_note = Some(if external_provider(info.auth_method, info.auth_provider.as_deref()) {
-                    "Loading Claude Code models; the CLI default model is available now."
+                    "Loading Claude Code models. Re-check this agent shortly."
                 } else {
-                    "Could not load Claude Code models. Re-check this harness or update Claude Code; the CLI default model is still available."
+                    "Could not load Claude Code models. Re-check this agent or update Claude Code."
                 }.to_string());
             }
             info = info.with_models(models.unwrap_or_default());
@@ -747,7 +1237,7 @@ impl ClaudeCode {
             info.agent_note = Some(info.broken_note("Reinstall it"));
         } else if info.auth_state == HarnessAuthState::Unsupported {
             info.agent_note = Some(
-                "Update Claude Code to 2.1.211 or newer, then re-check this harness.".to_string(),
+                "Update Claude Code to 2.1.211 or newer, then re-check this agent.".to_string(),
             );
         } else if info.installed {
             // A saved OAuth login overridden by the environment credential is
@@ -756,9 +1246,9 @@ impl ClaudeCode {
             // credential, not to sign in again.
             info.agent_note = Some(match info.auth_state {
                 HarnessAuthState::Unknown if info.needs_config_repair =>
-                    "Claude Code could not verify the effective `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. Fix or unset it, then re-check this harness.".to_string(),
+                    "Claude Code could not verify the effective `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. Fix or unset it, then re-check this agent.".to_string(),
                 HarnessAuthState::Unknown =>
-                    "Open a terminal and run `claude auth status`, then re-check this harness.".to_string(),
+                    "Open a terminal and run `claude auth status`, then re-check this agent.".to_string(),
                 _ => auth_recovery_note(info.auth_method, info.auth_provider.as_deref()).to_string(),
             });
         } else {
@@ -803,6 +1293,9 @@ impl Harness for ClaudeCode {
                 .ok_or_else(|| {
                     anyhow!("Claude Code's saved conversation is unavailable for compaction")
                 })?;
+        if ctx.profile.is_some() && native_session.store == NativeStore::Legacy {
+            return Ok(CompactOutcome::Fallback);
+        }
         let project = ctx.project.clone();
         let session_id = ctx.session_id.clone();
         let skills_dir = self.session_skills_dir();
@@ -822,9 +1315,11 @@ impl Harness for ClaudeCode {
                 effort: claude_effort(ctx.reasoning_level.as_deref()).map(str::to_string),
                 model: ctx.model.clone(),
                 native_store: native_session.store,
+                profile: ctx.profile.clone(),
                 alphaxiv_signed_in: crate::alphaxiv::signed_in(),
                 bridge_active: uses_permission_bridge(ctx.permission_mode)
                     && ctx.host.up_port().is_some(),
+                bin: find_claude(),
             },
         };
         ctx.host
@@ -2005,6 +2500,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                 ctx.report_usage(ContextUsage {
                     used_tokens: used,
                     context_window: None,
+                    ..Default::default()
                 });
             }
         }
@@ -2062,6 +2558,9 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                     }
                 }
             }
+        }
+        Some("rate_limit_event") => {
+            crate::local::usage::observed(&ctx.host, &ctx.harness, ctx.profile.as_deref());
         }
         Some("result") => {
             if let Some(scope) = event.get("session_id").and_then(Value::as_str) {
@@ -2197,12 +2696,19 @@ fn record_message(ctx: &TurnCtx, message: &Value) {
             cache_write_tokens: field("cache_creation_input_tokens"),
             reasoning_tokens: None,
         },
+        None,
     );
 }
 
+/// Per model: its running totals for the process, and what Claude Code says they cost.
 fn claude_result_usage_samples(
     event: &Value,
-) -> Vec<(String, Option<String>, crate::store::TokenUsage)> {
+) -> Vec<(
+    String,
+    Option<String>,
+    crate::store::TokenUsage,
+    Option<crate::store::Cost>,
+)> {
     event
         .get("modelUsage")
         .and_then(Value::as_object)
@@ -2225,6 +2731,10 @@ fn claude_result_usage_samples(
                     cache_write_tokens: field("cacheCreationInputTokens"),
                     reasoning_tokens: field("thinkingTokens"),
                 },
+                usage
+                    .get("costUSD")
+                    .and_then(Value::as_f64)
+                    .and_then(|dollars| crate::store::Cost::of(dollars, "USD")),
             )
         })
         .collect()
@@ -2290,6 +2800,7 @@ fn report_result_usage(ctx: &mut TurnCtx, event: &Value) -> Option<u64> {
         ctx.report_usage(ContextUsage {
             used_tokens: used,
             context_window,
+            ..Default::default()
         });
     }
     event_used
@@ -2314,9 +2825,11 @@ fn spawn_config(ctx: &TurnCtx, native_store: NativeStore) -> SpawnConfig {
         effort: claude_effort(ctx.reasoning_level.as_deref()).map(str::to_string),
         model: ctx.model.clone(),
         native_store,
+        profile: ctx.profile.clone(),
         alphaxiv_signed_in: crate::alphaxiv::signed_in(),
         // A failed bridge setup must respawn next turn rather than reuse a child without input.
         bridge_active: uses_permission_bridge(ctx.permission_mode) && ctx.host.up_port().is_some(),
+        bin: find_claude(),
     }
 }
 
@@ -2478,7 +2991,7 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
                 } else {
                     (
                         format!("produced no output for {}s", FIRST_EVENT_TIMEOUT.as_secs()),
-                        " (check Claude Code authentication in Harnesses)",
+                        " (check Claude Code in Agents settings)",
                     )
                 };
                 return Err(anyhow!(
@@ -2589,7 +3102,32 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
         ctx.mark_delivery(DeliveryState::Rejected);
     }
     commit_attempt_session(ctx, &state);
+    if !state.turn_errored {
+        report_compact_at(ctx, client).await;
+    }
     Ok((state, auth_generation))
+}
+
+/// Where the resident child compacts on its own, asked after each turn so it
+/// follows a model switch. Best effort: the next turn asks again.
+async fn report_compact_at(ctx: &mut TurnCtx, client: &crate::local::claude::ClaudeClient) {
+    let request = client.control_request(json!({ "subtype": "get_context_usage" }));
+    let Ok(Ok(Ok(context))) = tokio::time::timeout(Duration::from_secs(2), request).await else {
+        return;
+    };
+    if let Some(compact_at) = compact_at(&context) {
+        ctx.report_compact_at(compact_at);
+    }
+}
+
+/// Where auto-compact fires, `Some(None)` when it is off; None when the answer can't say.
+fn compact_at(context: &Value) -> Option<Option<u64>> {
+    let enabled = context.get("isAutoCompactEnabled")?.as_bool()?;
+    Some(
+        enabled
+            .then(|| context.get("autoCompactThreshold")?.as_u64())
+            .flatten(),
+    )
 }
 
 /// A child that dies before echoing the prompt never read it, so the turn can
@@ -2649,6 +3187,8 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
             .map_err(|error| anyhow!("Claude session lookup failed: {error}"))??,
         None => None,
     };
+    let native_session = native_session
+        .filter(|session| ctx.profile.is_none() || session.store == NativeStore::Isolated);
     let native_store = native_session
         .as_ref()
         .map(|session| session.store)
@@ -2680,7 +3220,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         let mut spec = base_spec.clone();
         spec.resume = resume.clone();
         let (attempt, failed_generation) = run_attempt(ctx, spec).await?;
-        if !attempt.auth_failed {
+        if !attempt.auth_failed || ctx.profile.is_some() {
             state = attempt;
             break;
         }
@@ -2733,9 +3273,9 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
                 "Claude Code authentication needs attention. Check `claude auth status`, then retry this message."
             }
             HarnessAuthState::Unknown => {
-                "Claude Code authentication could not be verified. Run `claude auth status`, then re-check the harness."
+                "Claude Code authentication could not be verified. Run `claude auth status`, then re-check the agent."
             }
-            _ => "Claude Code authentication failed. Re-check the harness, then retry this message.",
+            _ => "Claude Code authentication failed. Re-check the agent, then retry this message.",
         };
         ctx.push_error(detail.to_string());
         state = attempt;
@@ -3091,11 +3631,11 @@ mod tests {
         );
         assert_eq!(
             billing_label(Some("max"), Some("default_claude_max_5x"), None).as_deref(),
-            Some("Max 5x")
+            Some("Max")
         );
         assert_eq!(
             billing_label(Some("max"), Some("default_claude_max_20x"), None).as_deref(),
-            Some("Max 20x")
+            Some("Ultra")
         );
         assert_eq!(
             billing_label(Some("pro"), Some("default_claude_max_20x"), None).as_deref(),
@@ -3150,7 +3690,7 @@ mod tests {
         assert_eq!(
             with.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             ["claude-fable-5[1m]", "haiku"],
-            "the `default` entry is the composer's null-model row, not a model"
+            "model-less entries are excluded"
         );
         // The versioned name is promoted out of the description's first `·`
         // segment (the alias ids and `displayName` are unversioned).
@@ -3406,6 +3946,38 @@ mod tests {
     }
 
     #[test]
+    fn result_costs_ride_each_models_running_totals() {
+        let event = serde_json::json!({
+            "type": "result",
+            "total_cost_usd": 0.1750857,
+            "modelUsage": {
+                "claude-sonnet-5-5": {"inputTokens": 5416, "outputTokens": 12,
+                    "cacheReadInputTokens": 57912, "cacheCreationInputTokens": 63337,
+                    "costUSD": 0.1750857, "provider": "firstParty"},
+                "claude-haiku-4-5-20251001": {"inputTokens": 3, "outputTokens": 4,
+                    "cacheReadInputTokens": 0, "cacheCreationInputTokens": 9}
+            }
+        });
+        let samples = claude_result_usage_samples(&event);
+        let cost = |model: &str| {
+            samples
+                .iter()
+                .find(|(name, _, _, _)| name == model)
+                .unwrap()
+                .3
+                .clone()
+        };
+        assert_eq!(
+            cost("claude-sonnet-5-5"),
+            Some(crate::store::Cost {
+                micros: 175_086,
+                currency: "USD".into()
+            })
+        );
+        assert_eq!(cost("claude-haiku-4-5-20251001"), None);
+    }
+
+    #[test]
     fn native_model_usage_preserves_child_models_and_inclusive_totals() {
         let events: Vec<Value> =
             serde_json::from_str(include_str!("fixtures/claude-model-usage.json")).unwrap();
@@ -3413,21 +3985,21 @@ mod tests {
         assert_eq!(samples.len(), 2);
         let parent = samples
             .iter()
-            .find(|(model, _, _)| model == "claude-opus-5-5")
+            .find(|(model, _, _, _)| model == "claude-opus-5-5")
             .unwrap();
         assert_eq!(parent.2.input_tokens, Some(290410));
         assert_eq!(parent.2.output_tokens, Some(392));
         assert_eq!(parent.2.reasoning_tokens, Some(198));
         let child = samples
             .iter()
-            .find(|(model, _, _)| model == "claude-haiku-4-5-20251001")
+            .find(|(model, _, _, _)| model == "claude-haiku-4-5-20251001")
             .unwrap();
         assert_eq!(child.2.total(), Some(101006));
         let resumed = claude_result_usage_samples(&events[1]);
         assert_eq!(
             resumed
                 .iter()
-                .find(|(model, _, _)| model == "claude-opus-5-5")
+                .find(|(model, _, _, _)| model == "claude-opus-5-5")
                 .unwrap()
                 .2
                 .output_tokens,
@@ -4198,6 +4770,7 @@ mod tests {
         ctx.context_usage = Some(ContextUsage {
             used_tokens: 123,
             context_window: Some(200000),
+            ..Default::default()
         });
         let result = serde_json::json!({
             "type": "result",
@@ -4234,6 +4807,16 @@ mod tests {
         );
         assert_eq!(key.method, Some("apiKey"));
         assert_eq!(key.provider.as_deref(), Some("bedrock"));
+        let helper = parse_auth_status(
+            Some(0),
+            br#"{"loggedIn":true,"authMethod":"api_key_helper","apiProvider":"firstParty","apiKeySource":"ANTHROPIC_API_KEY"}"#,
+            2,
+        );
+        assert_eq!(helper.method, Some("apiKey"));
+        assert_eq!(
+            gate_oauth_version(helper, None).state,
+            HarnessAuthState::Ready
+        );
 
         let signed_out = parse_auth_status(
             Some(1),

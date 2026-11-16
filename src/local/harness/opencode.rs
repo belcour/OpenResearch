@@ -151,16 +151,19 @@ impl OpenCode {
                     let busy = error
                         .downcast_ref::<native_store::opencode_database::DatabaseBusy>()
                         .is_some();
+                    let needs_v2 = error
+                        .downcast_ref::<native_store::opencode_database::NeedsOpenCode2>()
+                        .is_some();
                     info.auth_state = if busy {
                         HarnessAuthState::Unknown
                     } else {
                         HarnessAuthState::Unsupported
                     };
-                    // A database the CLI will not open is not an out-of-date
-                    // binary: upgrading a current install cannot repair it, and
-                    // orx must never delete a user's database to clear it.
-                    info.needs_config_repair = !busy;
-                    info.agent_note = Some(if busy {
+                    // Any other database the CLI will not open is not an
+                    // out-of-date binary: upgrading cannot repair it, and orx
+                    // must never delete a user's database to clear it.
+                    info.needs_config_repair = !busy && !needs_v2;
+                    info.agent_note = Some(if busy || needs_v2 {
                         error.to_string()
                     } else {
                         format!(
@@ -235,9 +238,10 @@ impl OpenCode {
             ("deepseek", "DEEPSEEK_API_KEY"),
         ];
         if !info.authenticated
-            && PROVIDER_KEYS.iter().any(|(id, key)| {
-                provider_enabled(&config, id) && super::detect::api_key(key).is_some()
-            })
+            && (crate::local::local_models::configures_remote()
+                || PROVIDER_KEYS.iter().any(|(id, key)| {
+                    provider_enabled(&config, id) && super::detect::api_key(key).is_some()
+                }))
         {
             info.authenticated = true;
             info.auth_method = Some("apiKey");
@@ -258,15 +262,19 @@ impl OpenCode {
         if missing_local {
             info.agent_note = Some("Some local models are unavailable. Start the server, load the configured model, and re-check OpenCode.".to_string());
         }
+        let free = free_models_offered();
         models.retain(|model| {
+            if public_models.contains(&model.id) && !free {
+                return false;
+            }
             available.contains(&model.id)
                 || (info.authenticated && !is_local(model))
                 || (public_models.contains(&model.id)
                     && provider_enabled(&config, "opencode")
                     && !is_local(model))
         });
-        // Onboarding and the composer seed their selection from the first model.
         let default = config.get("model").and_then(Value::as_str);
+        info.configured_model = default.map(str::to_owned);
         models.sort_by_key(|model| {
             (
                 Some(model.id.as_str()) != default,
@@ -372,6 +380,7 @@ impl Harness for OpenCode {
     }
 
     async fn one_shot(&self, request: OneShot<'_>) -> Result<String> {
+        let _in_use = super::managed::OPENCODE_IN_USE.read().await;
         selected_generation_model(request.model)?;
         opencode_one_shot(&crate::local::opencode::resolve_binary().await?, request).await
     }
@@ -531,6 +540,13 @@ fn snapshot_config() -> (Value, bool) {
         let _ = crate::local::local_models::merge_config(&mut config, &connections, None);
     }
     (config, unresolved)
+}
+
+/// Whether the user keeps OpenCode's free models on; they are unless switched off.
+fn free_models_offered() -> bool {
+    crate::store::Store::open()
+        .and_then(|store| store.ui_state())
+        .map_or(true, |state| state.opencode_free_models)
 }
 
 /// Providers opencode is signed into (its auth.json is `{provider: {type}}`).
@@ -828,7 +844,8 @@ async fn run_models(bin: PathBuf, args: &[&str]) -> Option<String> {
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    crate::local::local_models::prepare_env(&mut cmd, None).ok()?;
+    crate::local::local_models::prepare_env(&mut cmd, None, crate::local::opencode::Protocol::V1)
+        .ok()?;
     cmd.env("OPENCODE_DB", ":memory:")
         .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
         // The probe runs from the home dir, so project-layer discovery is
@@ -1565,6 +1582,7 @@ async fn opencode_pre_accept_setup(
 }
 
 async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
+    let _in_use = super::managed::OPENCODE_IN_USE.read().await;
     // Native permission and question requests die with their turn. Clear any
     // crash/restart leftovers before a new live request can be surfaced.
     ctx.host.resolve_stale_prompts(&ctx.session_id, true)?;
@@ -1762,6 +1780,14 @@ fn opencode_native_usage(tokens: &Value) -> crate::store::TokenUsage {
     }
 }
 
+/// The dollars OpenCode reports a step or message cost.
+fn opencode_cost(value: &Value) -> Option<crate::store::Cost> {
+    value
+        .get("cost")
+        .and_then(Value::as_f64)
+        .and_then(|dollars| crate::store::Cost::of(dollars, "USD"))
+}
+
 fn opencode_used_tokens(tokens: Option<&Value>) -> Option<u64> {
     let tokens = tokens?;
     let field = |v: &Value, name: &str| v.get(name).and_then(Value::as_u64).unwrap_or(0);
@@ -1886,6 +1912,7 @@ fn handle_event(
                             Some(model),
                             Some(provider),
                             crate::store::TokenUsage::default(),
+                            None,
                         );
                     }
                     ctx.native_message_models.insert(
@@ -1909,6 +1936,7 @@ fn handle_event(
                     ctx.report_usage(ContextUsage {
                         used_tokens: used,
                         context_window: None,
+                        ..Default::default()
                     });
                 }
             }
@@ -1936,6 +1964,7 @@ fn handle_event(
                         identity.map(|i| i.model.as_str()),
                         identity.and_then(|i| i.provider.as_deref()),
                         opencode_native_usage(tokens),
+                        opencode_cost(part),
                     );
                 }
             }
@@ -2239,12 +2268,10 @@ mod tests {
         let script = "@echo off\r\necho %*>>\"%ORX_TEST_OPENCODE_LOG%\"\r\nif \"%1\"==\"--version\" (echo 1.18.35& exit /b 0)\r\nif \"%1\"==\"models\" (echo openrouter/paid& exit /b 0)\r\nexit /b 0\r\n";
         #[cfg(not(windows))]
         let script = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ORX_TEST_OPENCODE_LOG\"\ncase \"$1\" in\n--version) echo 1.18.35;;\nmodels) echo openrouter/paid;;\nesac\n";
-        std::fs::write(&cli, script).unwrap();
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        orx_test_support::write_executable(&cli, script, 0o700).unwrap();
+        #[cfg(windows)]
+        std::fs::write(&cli, script).unwrap();
         let log = root.join("calls.log");
         std::env::set_var("ORX_TEST_OPENCODE_LOG", &log);
         std::env::set_var("PATH", &bin);
@@ -2789,6 +2816,17 @@ opencode/unknown
     }
 
     #[test]
+    fn step_and_message_costs_are_dollars_and_absence_is_unreported() {
+        let step = json!({"type": "step-finish", "cost": 0.0123, "tokens": {"input": 1}});
+        let cost = opencode_cost(&step).unwrap();
+        assert_eq!((cost.micros, cost.currency.as_str()), (12_300, "USD"));
+        // A free model reports zero, which is a price; no field is no price.
+        assert_eq!(opencode_cost(&json!({"cost": 0})).unwrap().micros, 0);
+        assert!(opencode_cost(&json!({"tokens": {}})).is_none());
+        assert!(opencode_cost(&json!({"cost": -1})).is_none());
+    }
+
+    #[test]
     fn message_updated_reports_summed_tokens_without_window() {
         let mut ctx = TurnCtx::test_stub();
         let mut msgs = HashSet::new();
@@ -3032,8 +3070,6 @@ opencode/unknown
     /// A `#!/bin/sh` stand-in for the opencode CLI, as in `detect.rs`.
     #[cfg(unix)]
     fn sh_script(name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir =
             std::env::temp_dir().join(format!("orx-opencode-capture-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3043,8 +3079,7 @@ opencode/unknown
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.31; exit 0; fi\n",
             1,
         );
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        orx_test_support::write_executable(&path, body, 0o755).unwrap();
         path
     }
 
